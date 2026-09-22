@@ -56,13 +56,26 @@ class Database:
         self.conn.commit()
 
     @staticmethod
-    def _safe_upload_path(org, document_id, version_id):
+    def _safe_upload_path(org, resource_id, generated_id=None):
         root = Path(os.getenv('APP_UPLOAD_DIR', '.data/uploads')).resolve()
-        path = (root / org / document_id / version_id).resolve()
-        if root not in path.parents:
-            raise ValueError('invalid document storage path')
+        generated_id = generated_id or uid()
+        path = (root / str(org) / str(resource_id) / str(generated_id)).resolve()
+        if root not in path.parents or path == root:
+            raise ValueError('invalid upload storage path')
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    @staticmethod
+    def _validate_upload(content, content_type=None):
+        max_bytes = int(os.getenv('APP_MAX_UPLOAD_BYTES', str(20 * 1024 * 1024)))
+        if not isinstance(content, (bytes, bytearray)) or not content:
+            raise ValueError('upload content is required')
+        if len(content) > max_bytes:
+            raise ValueError('upload exceeds maximum size')
+        allowed_types = {'application/pdf', 'application/octet-stream', 'text/plain'}
+        if content_type and content_type not in allowed_types:
+            raise ValueError('unsupported upload content type')
+        return bytes(content)
 
     def execute(self, sql, params=()):
         return self.conn.execute(sql, params)
@@ -367,8 +380,7 @@ class Database:
                 "met": eligible > 0 and present >= required}
 
     def add_document(self, org, actor, title, content, meeting=None, agenda=None, classification="internal", content_type=None):
-        if not isinstance(content, (bytes, bytearray)) or not content:
-            raise ValueError('document content is required')
+        content = self._validate_upload(content, content_type)
         if meeting:
             self._require_meeting(org, meeting)
         if agenda and not self.execute(
@@ -396,8 +408,7 @@ class Database:
         return document_id
 
     def replace_document(self, org, actor, document_id, content, content_type=None):
-        if not isinstance(content, (bytes, bytearray)) or not content:
-            raise ValueError('document content is required')
+        content = self._validate_upload(content, content_type)
         if not self.execute(
             "SELECT 1 FROM documents WHERE id=? AND organisation_id=? AND deleted_at IS NULL",
             (document_id, org),

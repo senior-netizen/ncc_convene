@@ -39,12 +39,12 @@ existing NCC Super Admin member ID; the command-line reset is therefore refused.
 4. Use the meeting workspace forms to assign participants, record attendance, save an RSVP, declare and manage conflicts, create motions, cast/close votes, create resolutions, save minutes, and create actions.
 5. Upload a real PDF from the Board papers form. Use `Replace version` on the paper row to upload a new file; the version list and download link expose the latest stored bytes.
 6. For an action, add an update, attach completion evidence (note plus optional PDF), then select `Complete action`. Completion is rejected until evidence exists.
-7. Move the meeting through its permitted lifecycle buttons: `draft → scheduled → published → completed`; cancellation is available before completion. Finish on `/activity-log` to verify the append-only audit trail.
+7. Move the meeting through its permitted lifecycle buttons: `draft → scheduled → published → completed`; cancellation is available before completion. Switch to `orgadmin@ncc.example` or `superadmin@ncc.example` before opening `/activity-log`; Secretariat does not have `audit.read`.
 8. Use `commissioner01@ncc.example` in a separate session for member RSVP/voting demonstrations where role ownership matters.
 
 ## API demo path
 
-Sign in with `POST /login`, then use the session cookie to create a draft meeting (`POST /meetings`), build its agenda (`POST /meetings/{id}/agenda`), assign participants (`POST /meetings/{id}/participants`), and publish it (`POST /meetings/{id}/transition` with `{"status":"published"}`). The Secretariat can then record RSVPs and attendance. All mutation endpoints expect JSON and audit their changes.
+Sign in with `POST /login`, then use the session cookie to create a draft meeting (`POST /meetings`), build its agenda (`POST /meetings/{id}/agenda`), and assign participants (`POST /meetings/{id}/participants`). Transition it in order: `POST /meetings/{id}/transition` with `{"status":"scheduled"}`, then the same route with `{"status":"published"}`. The Secretariat can then record RSVPs and attendance. All mutation endpoints expect JSON and audit their changes.
 
 ## Data and permissions
 
