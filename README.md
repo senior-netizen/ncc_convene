@@ -9,11 +9,15 @@ Requires Python 3.11+ (no third-party runtime dependencies).
 ```bash
 python -m app.seed --database .data/ncc-convene.db
 APP_DATABASE=.data/ncc-convene.db APP_SESSION_SECRET='replace-this-with-a-long-random-secret' python -m app.web
-# Open http://127.0.0.1:8000. Demo login: secretariat@ncc.example / ChangeMe123!
+# Open http://127.0.0.1:8000/login. Demo login: secretariat@ncc.example / ChangeMe123!
 python -m unittest discover -v
 ```
 
 `APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Deploy behind HTTPS and set `APP_COOKIE_SECURE=1`.
+
+## Browser portal
+
+The dependency-free server also renders a small browser portal. Sign in at `/login`; protected browser routes redirect unauthenticated visitors there. The portal provides `/dashboard`, `/members`, `/activity-log`, and `/administration`. Each page applies the same server-side permissions as the JSON API, and pages for unfinished functionality state that it is not available yet rather than implying that data exists.
 
 ## API demo path
 

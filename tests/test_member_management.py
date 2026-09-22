@@ -42,6 +42,14 @@ class MemberManagementTests(unittest.TestCase):
         result = b"".join(self.web.app(env, lambda status, headers: received.append(status)))
         return received[0], json.loads(result)
 
+    def browser_request(self, path, member=None):
+        received = []
+        env = {"PATH_INFO": path, "REQUEST_METHOD": "GET", "QUERY_STRING": "",
+               "CONTENT_LENGTH": "0", "wsgi.input": BytesIO(), "HTTP_ACCEPT": "text/html",
+               "HTTP_COOKIE": f"session={token({'user': 'ignored', 'org': self.org, 'member': member or self.admin}, self.web.SECRET)}"}
+        result = b"".join(self.web.app(env, lambda status, headers: received.append((status, headers))))
+        return received[0], result.decode()
+
     def test_member_profile_lifecycle_persists_and_is_audited(self):
         status, payload = self.request("/members", "POST", {"email": "new@example.test", "display_name": "New Member", "title": "Director", "profile": {"phone": "+2631", "biography": "Profile"}})
         self.assertEqual(status, "201 Created"); member_id = payload["id"]
