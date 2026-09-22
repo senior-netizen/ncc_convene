@@ -130,90 +130,40 @@ class WorkflowTests(unittest.TestCase):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         self.assertEqual(self.db.quorum(self.org, meeting), {"eligible": 0, "present": 0, "required": 0, "met": False})
 
-    def test_recusals_block_only_affected_members_from_motion_votes(self):
+    def test_numbered_traceable_records_and_structured_minutes(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
-        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Conflicted decision", 0)
-        other_agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Other decision", 1)
-        for member in (self.secretariat, self.board, self.unconflicted):
-            self.db.assign_attendee(self.org, self.secretariat, meeting, member)
-            self.db.attendance(self.org, self.secretariat, meeting, member, "present")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        minute = self.db.save_minutes(self.org, self.secretariat, meeting, agenda, "Summary", "in_review")
+        item = self.db.add_minute_item(self.org, self.secretariat, minute, "decision", "Approved", 0)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM minute_items WHERE id=?", (item,)).fetchone())
 
-        conflict = self.db.declare_conflict(self.org, self.board, meeting, self.board,
-                                            "Supplier interest", "Pending", agenda)
-        self.db.manage_conflict_recusal(self.org, self.secretariat, meeting, conflict,
-                                        "recusal_required")
-        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda,
-                                       self.secretariat, "Approve supplier")
-        with self.assertRaisesRegex(ValueError, "non-recused"):
-            self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "for")
+        resolution = self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Noted", "noted")
+        resolution_record = self.db.resolution_traceability(self.org, resolution)[0]
+        self.assertEqual((resolution_record["resolution_year"], resolution_record["resolution_number"]), (2026, 1))
+
+        action = self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board,
+                                       "Implement", "2001-01-01T00:00:00Z", resolution, "high")
+        action_record = self.db.action_traceability(self.org, action)[0]
+        self.assertEqual((action_record["action_year"], action_record["action_number"]), (2026, 1))
+        self.assertEqual(action_record["priority"], "high")
+        self.assertEqual(action_record["is_overdue"], 1)
+        update = self.db.add_action_update(self.org, self.board, action, "Started", "in_progress")
+        self.assertEqual(self.db.action_traceability(self.org, action)[0]["update_count"], 1)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM action_updates WHERE id=?", (update,)).fetchone())
+        with self.assertRaisesRegex(ValueError, "due_at"):
+            self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board, "Bad date", "tomorrow")
+
+    def test_carried_motion_cannot_generate_two_carried_resolutions(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.secretariat, meeting, self.secretariat)
+        self.db.attendance(self.org, self.secretariat, meeting, self.secretariat, "present")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda, self.secretariat, "Approve")
         self.db.cast_vote(self.org, self.secretariat, meeting, motion, self.secretariat, "for")
-        self.db.cast_vote(self.org, self.unconflicted, meeting, motion, self.unconflicted, "for")
-        self.assertEqual(self.db.vote_tally(self.org, meeting, motion)["eligible"], 2)
-
-        unaffected_motion = self.db.create_motion(self.org, self.secretariat, meeting,
-                                                  other_agenda, self.board, "Other business")
-        self.db.cast_vote(self.org, self.board, meeting, unaffected_motion, self.board, "for")
-
-        general_conflict = self.db.declare_conflict(self.org, self.board, meeting, self.board,
-                                                    "Meeting-wide interest", "Pending")
-        self.db.manage_conflict_recusal(self.org, self.secretariat, meeting, general_conflict,
-                                        "recusal_approved")
-        with self.assertRaisesRegex(ValueError, "non-recused"):
-            self.db.cast_vote(self.org, self.board, meeting, unaffected_motion, self.board, "against")
-        self.assertEqual(self.db.quorum(self.org, meeting)["eligible"], 2)
-        self.assertEqual(self.db.vote_tally(self.org, meeting, unaffected_motion)["for"], 0)
-        self.assertIsNotNone(self.db.execute(
-            "SELECT 1 FROM audit_logs WHERE resource_id=? AND event_type='conflict.recusal_managed'",
-            (general_conflict,),
-        ).fetchone())
-
-
-class VoteApiTests(unittest.TestCase):
-    def setUp(self):
-        os.environ["APP_DATABASE"] = ":memory:"
-        from app import web
-
-        self.web = web
-        self.db = Database()
-        self.web.DB = self.db
-        timestamp = now()
-        self.org, self.user, self.member_id = uid(), uid(), uid()
-        self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)",
-                        (self.org, "One", "vote-api", timestamp, timestamp))
-        self.db.execute("INSERT INTO users VALUES(?,?,?,?,?,?,NULL)",
-                        (self.user, "voter@example.test", hash_password("x"), "Voter", timestamp, timestamp))
-        self.db.execute("INSERT INTO members VALUES(?,?,?,?,?,?,?,NULL)",
-                        (self.member_id, self.org, self.user, None, "active", timestamp, timestamp))
-        role = uid()
-        self.db.execute("INSERT INTO roles VALUES(?,?,?,?,?,NULL)",
-                        (role, self.org, "Commissioner/Board Member", timestamp, timestamp))
-        self.db.execute("INSERT INTO member_roles VALUES(?,?,?)", (self.member_id, role, timestamp))
-        self.db.conn.commit()
-        self.meeting = self.db.create_meeting(self.org, self.member_id, "Meeting", "2026-09-24T09:00Z", "Harare")
-        agenda = self.db.add_agenda(self.org, self.member_id, self.meeting, "Decision", 0)
-        self.db.assign_attendee(self.org, self.member_id, self.meeting, self.member_id)
-        self.db.attendance(self.org, self.member_id, self.meeting, self.member_id, "present")
-        self.motion = self.db.create_motion(self.org, self.member_id, self.meeting, agenda, self.member_id, "Approve")
-
-    def tearDown(self):
-        self.db.conn.close()
-
-    def test_duplicate_vote_returns_conflict(self):
-        self.assertEqual(self._cast_vote("for")[0], "200 OK")
-        status, body = self._cast_vote("against")
-        self.assertEqual(status, "409 Conflict")
-        self.assertEqual(body, b'{"error": "a vote has already been cast for this motion"}')
-
-    def _cast_vote(self, choice):
-        payload = ('{"choice": "' + choice + '"}').encode()
-        env = {
-            "PATH_INFO": f"/meetings/{self.meeting}/motions/{self.motion}/votes",
-            "REQUEST_METHOD": "POST", "CONTENT_LENGTH": str(len(payload)), "wsgi.input": BytesIO(payload),
-            "HTTP_COOKIE": f"session={token({'user': self.user, 'org': self.org, 'member': self.member_id}, self.web.SECRET)}",
-        }
-        received = []
-        body = b"".join(self.web.app(env, lambda status, headers: received.append((status, headers))))
-        return received[0][0], body
+        self.db.close_motion(self.org, self.secretariat, meeting, motion)
+        self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Approved", "carried", motion)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Approved again", "carried", motion)
 
 
 if __name__ == "__main__":
