@@ -36,8 +36,11 @@ existing NCC Super Admin member ID; the command-line reset is therefore refused.
 1. Start the server and sign in at `/login` as `secretariat@ncc.example`.
 2. Open the seeded Quarterly Commission Meeting from Dashboard.
 3. Review the agenda, papers, participants, attendance and quorum in the meeting workspace.
-4. Use the existing secured API/forms as Secretariat or Chairperson to manage conflicts, motions, resolutions, minutes and actions; use `commissioner01@ncc.example` for member RSVP/voting demonstrations.
-5. Finish on `/activity-log` to show the append-only audit trail.
+4. Use the meeting workspace forms to assign participants, record attendance, save an RSVP, declare and manage conflicts, create motions, cast/close votes, create resolutions, save minutes, and create actions.
+5. Upload a real PDF from the Board papers form. Use `Replace version` on the paper row to upload a new file; the version list and download link expose the latest stored bytes.
+6. For an action, add an update, attach completion evidence (note plus optional PDF), then select `Complete action`. Completion is rejected until evidence exists.
+7. Move the meeting through its permitted lifecycle buttons: `draft → scheduled → published → completed`; cancellation is available before completion. Finish on `/activity-log` to verify the append-only audit trail.
+8. Use `commissioner01@ncc.example` in a separate session for member RSVP/voting demonstrations where role ownership matters.
 
 ## API demo path
 

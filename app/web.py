@@ -6,6 +6,8 @@ from html import escape
 from http import cookies
 from pathlib import Path
 from urllib.parse import parse_qs
+from email import policy
+from email.parser import BytesParser
 from wsgiref.simple_server import make_server
 
 from .auth import read_token, token, verify_password
@@ -58,8 +60,27 @@ def login_page(message=""):
 
 
 def browser_body(env):
-    raw = env["wsgi.input"].read(int(env.get("CONTENT_LENGTH", "0") or 0)).decode("utf-8")
-    return {key: values[0] for key, values in parse_qs(raw, keep_blank_values=True).items()}
+    """Parse normal browser forms and multipart file uploads without dependencies."""
+    raw = env["wsgi.input"].read(int(env.get("CONTENT_LENGTH", "0") or 0))
+    content_type = env.get("CONTENT_TYPE", "")
+    if content_type.startswith("multipart/form-data"):
+        message = BytesParser(policy=policy.default).parsebytes(
+            b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw
+        )
+        values = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if part.get_filename():
+                values[name] = {"filename": part.get_filename(), "content": payload,
+                                "content_type": part.get_content_type()}
+            else:
+                values[name] = payload.decode("utf-8")
+        return values
+    text = raw.decode("utf-8")
+    return {key: values[0] for key, values in parse_qs(text, keep_blank_values=True).items()}
 
 
 def csrf_token(session):
@@ -200,11 +221,28 @@ def app(env, start):
             data = browser_body(env)
             denied = browser_csrf(data)
             if denied: return denied
+            upload = data.get('file') or {}
+            content = upload.get('content') if isinstance(upload, dict) else None
+            title = data.get('title', '').strip() or (upload.get('filename') if isinstance(upload, dict) else '')
             try:
-                document_id = DB.add_document(org, actor, data.get('title', '').strip(), data.get('content', '').encode('utf-8'), meeting_id, data.get('agenda_item_id') or None, data.get('classification', 'internal'), data.get('content_type') or 'text/plain')
-            except (KeyError, ValueError) as exc:
+                document_id = DB.add_document(org, actor, title, content, meeting_id, data.get('agenda_item_id') or None, data.get('classification', 'internal'), upload.get('content_type') if isinstance(upload, dict) else data.get('content_type'))
+            except (KeyError, TypeError, ValueError) as exc:
                 return html_send(start, '400 Bad Request', page('Upload failed', f'<h1>Upload failed</h1><p>{escape(str(exc))}</p>', session, roles))
             return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting_id}')])
+        if browser and method == 'POST' and path.startswith('/documents/') and path.endswith('/replace'):
+            denied = browser_require('documents.write')
+            if denied: return denied
+            document_id = path.strip('/').split('/')[1]
+            data = browser_body(env)
+            denied = browser_csrf(data)
+            if denied: return denied
+            upload = data.get('file') or {}
+            try:
+                DB.replace_document(org, actor, document_id, upload.get('content'), upload.get('content_type'))
+                meeting = DB.execute('SELECT meeting_id FROM documents WHERE id=? AND organisation_id=?', (document_id, org)).fetchone()
+                return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting["meeting_id"]}')])
+            except (KeyError, TypeError, ValueError) as exc:
+                return html_send(start, '400 Bad Request', page('Replacement failed', f'<h1>Replacement failed</h1><p>{escape(str(exc))}</p>', session, roles))
         if browser and method == 'POST' and path.startswith('/meetings/') and path.endswith('/agenda'):
             denied = browser_require('agenda.write')
             if denied: return denied
@@ -217,13 +255,44 @@ def app(env, start):
             except (KeyError, ValueError) as exc:
                 return html_send(start, '400 Bad Request', page('Agenda update failed', f'<h1>Agenda update failed</h1><p>{escape(str(exc))}</p>', session, roles))
             return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting_id}#agenda')])
+        if browser and method == 'POST' and path.startswith('/actions/'):
+            denied = browser_require('actions.write')
+            if denied: return denied
+            data = browser_body(env)
+            denied = browser_csrf(data)
+            if denied: return denied
+            action_id = path.strip('/').split('/')[1]
+            try:
+                if path.endswith('/evidence'):
+                    upload = data.get('file') or {}
+                    storage_key = None
+                    if isinstance(upload, dict) and upload.get('content'):
+                        storage_path = DB._safe_upload_path(org, action_id, upload.get('filename') or 'evidence')
+                        storage_path.write_bytes(upload['content'])
+                        storage_key = str(storage_path)
+                    DB.add_completion_evidence(org, actor, action_id, data.get('note') or upload.get('filename') or 'Evidence', storage_key)
+                elif path.endswith('/complete'):
+                    DB.complete_action(org, actor, action_id)
+                elif path.endswith('/updates'):
+                    DB.add_action_update(org, actor, action_id, data['body'], data.get('status') or None)
+                else: raise ValueError('unsupported action workflow')
+            except (KeyError, TypeError, ValueError) as exc:
+                return html_send(start, '400 Bad Request', page('Action update failed', f'<h1>Action update failed</h1><p>{escape(str(exc))}</p>', session, roles))
+            meeting = DB.execute('SELECT meeting_id FROM actions WHERE id=? AND organisation_id=?', (action_id, org)).fetchone()
+            return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting["meeting_id"]}')])
         if browser and method == 'POST' and path.startswith('/meetings/'):
             data = browser_body(env)
             denied = browser_csrf(data)
             if denied: return denied
             meeting_id = path.strip('/').split('/')[1]
             try:
-                if path.endswith('/attendance'):
+                if path.endswith('/transition'):
+                    if not require('meetings.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    DB.transition_meeting(org, actor, meeting_id, data['status'])
+                elif path.endswith('/participants'):
+                    if not require('meetings.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    DB.assign_attendee(org, actor, meeting_id, data['member_id'], data.get('observer') == '1')
+                elif path.endswith('/attendance'):
                     if not require('attendance.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.attendance(org, actor, meeting_id, data['member_id'], data['status'])
                 elif path.endswith('/rsvp'):
@@ -234,6 +303,12 @@ def app(env, start):
                     member_id = data.get('member_id', actor)
                     if not own_or('conflicts.write', member_id, 'conflicts.manage'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.declare_conflict(org, actor, meeting_id, member_id, data['interest'], data['management_action'], data.get('agenda_item_id') or None)
+                elif '/conflicts/' in path and path.endswith('/recusal'):
+                    if not require('conflicts.manage'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    DB.manage_conflict_recusal(org, actor, meeting_id, path.strip('/').split('/')[3], data['status'])
+                elif path.endswith('/participants'):
+                    if not require('meetings.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    DB.assign_attendee(org, actor, meeting_id, data['member_id'], data.get('observer') == '1')
                 elif path.endswith('/motions'):
                     if not require('motions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.create_motion(org, actor, meeting_id, data['agenda_item_id'], data['proposer_member_id'], data['text'])
@@ -253,6 +328,16 @@ def app(env, start):
                 elif path.endswith('/actions'):
                     if not require('actions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.create_action(org, actor, meeting_id, data['agenda_item_id'], data['owner_member_id'], data['description'], data.get('due_at') or None, data.get('resolution_id') or None, data.get('priority', 'normal'))
+                elif '/actions/' in path and path.endswith('/updates'):
+                    if not require('actions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    DB.add_action_update(org, actor, path.strip('/').split('/')[3], data['body'], data.get('status') or None)
+                elif '/actions/' in path and path.endswith('/evidence'):
+                    if not require('actions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    upload = data.get('file') or {}
+                    DB.add_completion_evidence(org, actor, path.strip('/').split('/')[3], data.get('note') or upload.get('filename') or 'Evidence', upload.get('storage_key') if isinstance(upload, dict) else None)
+                elif '/actions/' in path and path.endswith('/complete'):
+                    if not require('actions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    DB.complete_action(org, actor, path.strip('/').split('/')[3])
                 else:
                     raise ValueError('unsupported browser workflow action')
             except (KeyError, ValueError, DuplicateVoteError) as exc:
@@ -277,7 +362,7 @@ def app(env, start):
             paper_rows = ''.join(f'<tr><td>{escape(row["title"])}</td><td>{escape(row["classification"])}</td><td>{row["version_number"] or 0}</td><td>{row["size_bytes"] or 0} bytes</td><td><a href="/documents/{row["id"]}/download">View/download</a> · <a href="/documents/{row["id"]}/versions">Versions</a></td></tr>' for row in papers)
             paper_form = ''
             if allowed(roles, 'documents.write'):
-                paper_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/documents">{csrf_input(session)}<h3>Upload board paper</h3><label>Title <input name="title" required></label><label>Content type <input name="content_type" value="text/plain"></label><label>Classification <select name="classification"><option>internal</option><option>confidential</option><option>public</option></select></label><label>Content <textarea name="content" rows="6" required></textarea></label><button type="submit">Upload paper</button></form>'
+                paper_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/documents" enctype="multipart/form-data">{csrf_input(session)}<h3>Upload board paper</h3><label>Title <input name="title"></label><label>Classification <select name="classification"><option>internal</option><option>confidential</option><option>public</option></select></label><label>PDF or file <input type="file" name="file" accept=".pdf,application/pdf" required></label><button type="submit">Upload paper</button></form>'
             agenda_form = ''
             if allowed(roles, 'agenda.write'):
                 agenda_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/agenda">{csrf_input(session)}<h3>Add agenda item</h3><label>Title <input name="title" required></label><label>Position <input name="position" type="number" min="1" value="{len(agenda) + 1}" required></label><button type="submit">Add item</button></form>'
@@ -291,7 +376,24 @@ def app(env, start):
             motion_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td><td>For {} / Against {} / Abstain {}</td></tr>'.format(escape(m['agenda_title']), escape(m['text']), escape(m['status']), DB.vote_tally(org, meeting_id, m['id'])['for'], DB.vote_tally(org, meeting_id, m['id'])['against'], DB.vote_tally(org, meeting_id, m['id'])['abstain']) for m in motions)
             resolution_rows = ''.join('<tr><td>NCC/RES/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(r['resolution_year'], r['resolution_number'], escape(r['text']), escape(r['outcome']), escape(r['status'])) for r in resolutions)
             action_rows = ''.join('<tr><td>NCC/ACT/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(a['action_year'], a['action_number'], escape(a['description']), escape(a['status']) + (' · OVERDUE' if a['is_overdue'] else ''), a['update_count']) for a in actions)
-            content = f'<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong></p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol>{agenda_form}</section><section id="papers"><h2>Board papers</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th><th>Access</th></tr>{paper_rows}</table>{paper_form}</section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table></section><section id="conflicts"><h2>Conflicts</h2><table><tr><th>Member</th><th>Agenda</th><th>Interest</th><th>Management</th><th>Status</th></tr>{conflict_rows}</table></section><section id="motions"><h2>Motions & voting</h2><table><tr><th>Agenda</th><th>Motion</th><th>Status</th><th>Tally</th></tr>{motion_rows}</table></section><section id="resolutions"><h2>Resolutions</h2><table><tr><th>Number</th><th>Text</th><th>Outcome</th><th>Status</th></tr>{resolution_rows}</table></section><section id="minutes"><h2>Minutes</h2><p>Structured minutes are maintained through the secured workflow.</p></section><section id="actions"><h2>Actions</h2><table><tr><th>Number</th><th>Description</th><th>Status</th><th>Updates</th></tr>{action_rows}</table></section>'
+            member_options = ''.join(f'<option value="{m["member_id"]}">{escape(m["name"] or "")}</option>' for m in participants)
+            agenda_options = ''.join(f'<option value="{a["id"]}">{escape(a["title"])}</option>' for a in agenda)
+            lifecycle = ''
+            if allowed(roles, 'meetings.write'):
+                next_statuses = {'draft': ('scheduled', 'cancelled'), 'scheduled': ('published', 'cancelled'), 'published': ('completed', 'cancelled')}.get(meeting['status'], ())
+                lifecycle = ''.join(f'<form method="post" action="/meetings/{meeting_id}/transition" style="display:inline">{csrf_input(session)}<input type="hidden" name="status" value="{s}"><button type="submit">{s.title()} meeting</button></form>' for s in next_statuses)
+            participant_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/participants">{csrf_input(session)}<h3>Assign participant</h3><select name="member_id" required>{member_options}</select><label><input type="checkbox" name="observer" value="1"> Observer</label><button type="submit">Assign</button></form>' if allowed(roles, 'meetings.write') else ''
+            attendance_forms = ''.join(f'<form method="post" action="/meetings/{meeting_id}/attendance">{csrf_input(session)}<input type="hidden" name="member_id" value="{p["member_id"]}"><select name="status"><option>present</option><option>absent</option><option>apology</option></select><button type="submit">Save attendance for {escape(p["name"] or "")}</button></form>' for p in participants) if allowed(roles, 'attendance.write') else ''
+            rsvp_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/rsvp">{csrf_input(session)}<h3>My RSVP</h3><select name="response"><option>yes</option><option>maybe</option><option>no</option></select><button type="submit">Save RSVP</button></form>' if allowed(roles, 'rsvp.write') else ''
+            conflict_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/conflicts">{csrf_input(session)}<h3>Declare conflict</h3><input type="hidden" name="agenda_item_id" value=""><label>Interest <textarea name="interest" required></textarea></label><label>Management action <input name="management_action" required></label><button type="submit">Declare conflict</button></form>' if allowed(roles, 'conflicts.write') else ''
+            motion_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/motions">{csrf_input(session)}<h3>Create motion</h3><select name="agenda_item_id" required>{agenda_options}</select><select name="proposer_member_id" required>{member_options}</select><textarea name="text" required></textarea><button type="submit">Create motion</button></form>' if allowed(roles, 'motions.write') else ''
+            motion_controls = ''.join(f'<form method="post" action="/meetings/{meeting_id}/motions/{m["id"]}/votes">{csrf_input(session)}<input type="hidden" name="choice" value="for"><button type="submit">Vote for</button></form><form method="post" action="/meetings/{meeting_id}/motions/{m["id"]}/close">{csrf_input(session)}<button type="submit">Close motion</button></form>' for m in motions if m['status'] == 'open')
+            resolution_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/resolutions">{csrf_input(session)}<h3>Create resolution</h3><select name="agenda_item_id">{agenda_options}</select><input name="text" required><select name="outcome"><option>noted</option><option>carried</option><option>not_carried</option></select><button type="submit">Create resolution</button></form>' if allowed(roles, 'resolutions.write') else ''
+            minutes_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/minutes">{csrf_input(session)}<h3>Save minutes</h3><select name="agenda_item_id">{agenda_options}</select><textarea name="body" required></textarea><select name="status"><option>draft</option><option>in_review</option><option>approved</option></select><button type="submit">Save minutes</button></form>' if allowed(roles, 'minutes.write') else ''
+            action_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/actions">{csrf_input(session)}<h3>Create action</h3><select name="agenda_item_id">{agenda_options}</select><select name="owner_member_id">{member_options}</select><input name="description" required><input name="due_at" type="datetime-local"><button type="submit">Create action</button></form>' if allowed(roles, 'actions.write') else ''
+            action_controls = ''.join(f'<form method="post" action="/actions/{a["id"]}/evidence" enctype="multipart/form-data">{csrf_input(session)}<input name="note" placeholder="Evidence note" required><input type="file" name="file" accept=".pdf,application/pdf"><button type="submit">Add evidence</button></form><form method="post" action="/actions/{a["id"]}/complete">{csrf_input(session)}<button type="submit">Complete action</button></form>' for a in actions if a['status'] in ('open', 'in_progress'))
+            replace_forms = ''.join(f'<form method="post" action="/documents/{p["id"]}/replace" enctype="multipart/form-data">{csrf_input(session)}<input type="file" name="file" accept=".pdf,application/pdf" required><button type="submit">Replace version</button></form>' for p in papers) if allowed(roles, 'documents.write') else ''
+            content = f'<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p><p>{lifecycle}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong></p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol>{agenda_form}</section><section id="papers"><h2>Board papers</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th><th>Access</th></tr>{paper_rows}</table>{replace_forms}{paper_form}</section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table>{participant_form}{attendance_forms}{rsvp_form}</section><section id="conflicts"><h2>Conflicts</h2><table><tr><th>Member</th><th>Agenda</th><th>Interest</th><th>Management</th><th>Status</th></tr>{conflict_rows}</table>{conflict_form}</section><section id="motions"><h2>Motions & voting</h2><table><tr><th>Agenda</th><th>Motion</th><th>Status</th><th>Tally</th></tr>{motion_rows}</table>{motion_controls}{motion_form}</section><section id="resolutions"><h2>Resolutions</h2><table><tr><th>Number</th><th>Text</th><th>Outcome</th><th>Status</th></tr>{resolution_rows}</table>{resolution_form}</section><section id="minutes"><h2>Minutes</h2><p>Structured minutes are maintained through the secured workflow.</p>{minutes_form}</section><section id="actions"><h2>Actions</h2><table><tr><th>Number</th><th>Description</th><th>Status</th><th>Updates</th></tr>{action_rows}</table>{action_controls}{action_form}</section>'
             return html_send(start, '200 OK', page('Meeting workspace', content, session, roles))
         if browser and method == "GET" and path == "/members":
             denied = browser_require("members.read")
