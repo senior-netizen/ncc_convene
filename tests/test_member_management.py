@@ -42,6 +42,14 @@ class MemberManagementTests(unittest.TestCase):
         result = b"".join(self.web.app(env, lambda status, headers: received.append(status)))
         return received[0], json.loads(result)
 
+    def browser_request(self, path, member=None):
+        received = []
+        env = {"PATH_INFO": path, "REQUEST_METHOD": "GET", "QUERY_STRING": "",
+               "CONTENT_LENGTH": "0", "wsgi.input": BytesIO(), "HTTP_ACCEPT": "text/html",
+               "HTTP_COOKIE": f"session={token({'user': 'ignored', 'org': self.org, 'member': member or self.admin}, self.web.SECRET)}"}
+        result = b"".join(self.web.app(env, lambda status, headers: received.append((status, headers))))
+        return received[0], result.decode()
+
     def test_member_profile_lifecycle_persists_and_is_audited(self):
         status, payload = self.request("/members", "POST", {"email": "new@example.test", "display_name": "New Member", "title": "Director", "profile": {"phone": "+2631", "biography": "Profile"}})
         self.assertEqual(status, "201 Created"); member_id = payload["id"]
@@ -59,3 +67,15 @@ class MemberManagementTests(unittest.TestCase):
         self.assertEqual(self.request(f"/members/{self.foreign_member}/roles", "POST", {"role_id": self.role})[0], "400 Bad Request")
         foreign_role = self.db.execute("SELECT id FROM roles WHERE organisation_id=?", (self.other_org,)).fetchone()["id"]
         self.assertEqual(self.request(f"/members/{self.viewer}/roles", "POST", {"role_id": foreign_role})[0], "400 Bad Request")
+
+    def test_browser_routes_redirect_or_apply_their_existing_permissions(self):
+        received = []
+        response = b"".join(self.web.app({"PATH_INFO": "/dashboard", "REQUEST_METHOD": "GET", "QUERY_STRING": "", "CONTENT_LENGTH": "0", "wsgi.input": BytesIO(), "HTTP_ACCEPT": "text/html"}, lambda status, headers: received.append((status, headers))))
+        self.assertEqual(received[0][0], "303 See Other")
+        self.assertIn(("Location", "/login"), received[0][1])
+        status, content = self.browser_request("/members")
+        self.assertEqual(status[0], "200 OK")
+        self.assertIn("<h1>Members</h1>", content)
+        status, content = self.browser_request("/activity-log")
+        self.assertEqual(status[0], "403 Forbidden")
+        self.assertIn("Access denied", content)
