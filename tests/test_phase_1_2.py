@@ -60,7 +60,8 @@ class RsvpAuthorisationTests(unittest.TestCase):
   t=now(); self.org=uid(); self.database.execute('INSERT INTO organisations VALUES(?,?,?,?,?,NULL)',(self.org,'One','rsvp-one',t,t))
   self.commissioner=self._member('commissioner@example.test')
   self.other_member=self._member('other@example.test')
-  role=uid(); self.database.execute('INSERT INTO roles VALUES(?,?,?,?,?,NULL)',(role,self.org,'Commissioner/Board Member',t,t)); self.database.execute('INSERT INTO member_roles VALUES(?,?,?)',(self.commissioner,role,t)); self.database.conn.commit()
+  self.secretariat=self._member('secretariat@example.test')
+  role=uid(); secretariat_role=uid(); self.database.execute('INSERT INTO roles VALUES(?,?,?,?,?,NULL)',(role,self.org,'Commissioner/Board Member',t,t)); self.database.execute('INSERT INTO roles VALUES(?,?,?,?,?,NULL)',(secretariat_role,self.org,'Secretariat',t,t)); self.database.execute('INSERT INTO member_roles VALUES(?,?,?)',(self.commissioner,role,t)); self.database.execute('INSERT INTO member_roles VALUES(?,?,?)',(self.secretariat,secretariat_role,t)); self.database.conn.commit()
   self.meeting=self.database.create_meeting(self.org,self.commissioner,'Meeting','2026-01-01T00:00Z','Harare')
 
  def tearDown(self): self.database.conn.close()
@@ -81,3 +82,18 @@ class RsvpAuthorisationTests(unittest.TestCase):
   self.assertEqual(received[0][0],'403 Forbidden')
   self.assertEqual(result,b'{"error": "forbidden"}')
   self.assertIsNone(self.database.execute('SELECT 1 FROM meeting_rsvps WHERE member_id=?',(self.other_member,)).fetchone())
+
+ def test_only_conflict_managers_can_record_recusal_decision(self):
+  from io import BytesIO
+  from app.auth import token
+  self.assertTrue(allowed({'Chairperson'},'conflicts.manage'))
+  agenda=self.database.add_agenda(self.org,self.commissioner,self.meeting,'Decision',0)
+  conflict=self.database.declare_conflict(self.org,self.commissioner,self.meeting,self.commissioner,'Interest','Pending',agenda)
+  payload=b'{"status":"recusal_required"}'
+  def request(member):
+   env={'PATH_INFO':f'/meetings/{self.meeting}/conflicts/{conflict}/recusal','REQUEST_METHOD':'POST','CONTENT_LENGTH':str(len(payload)),'wsgi.input':BytesIO(payload),'HTTP_COOKIE':f'session={token({"user":"unused","org":self.org,"member":member},self.web.SECRET)}'}
+   received=[]; result=b''.join(self.web.app(env,lambda status,headers: received.append((status,headers))))
+   return received[0][0],result
+  self.assertEqual(request(self.commissioner),('403 Forbidden',b'{"error": "forbidden"}'))
+  self.assertEqual(request(self.secretariat),('200 OK',b'{"ok": true}'))
+  self.assertEqual(self.database.execute('SELECT status FROM conflict_declarations WHERE id=?',(conflict,)).fetchone()['status'],'recusal_required')

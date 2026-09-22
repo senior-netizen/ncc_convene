@@ -15,6 +15,10 @@ def uid():
     return str(uuid.uuid4())
 
 
+class DuplicateVoteError(ValueError):
+    """Raised when a member attempts to cast more than one vote on a motion."""
+
+
 class Database:
     """Tenant-scoped persistence operations for the NCC Convene application."""
 
@@ -23,6 +27,23 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA.read_text())
+        self._migrate_member_profiles()
+
+    def _migrate_member_profiles(self):
+        """Add profile fields without rebuilding members or losing governance data."""
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(member_profiles)")}
+        additions = {
+            "display_name": "TEXT",
+            "email": "TEXT",
+            "profile_image_url": "TEXT",
+            "term_starts_on": "TEXT",
+            "term_ends_on": "TEXT",
+            "deactivated_at": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE member_profiles ADD COLUMN {name} {definition}")
+        self.conn.commit()
 
     def execute(self, sql, params=()):
         return self.conn.execute(sql, params)
@@ -82,10 +103,12 @@ class Database:
             raise ValueError("member outside tenant")
 
     def list_members(self, org, search=None, status=None):
-        """Return only members and profile data belonging to ``org``."""
+        """Return tenant-scoped member identity, contact, and term information."""
         sql = ("SELECT m.id,m.organisation_id,m.user_id,m.title,m.status,m.created_at,m.updated_at,"
-               "u.email,u.display_name,p.phone,p.address,p.biography "
-               "FROM members m JOIN users u ON u.id=m.user_id "
+               "COALESCE(p.display_name,u.display_name) AS display_name,"
+               "COALESCE(p.email,u.email) AS email,p.phone,p.address,p.biography,"
+               "p.profile_image_url,p.term_starts_on,p.term_ends_on,p.deactivated_at "
+               "FROM members m LEFT JOIN users u ON u.id=m.user_id "
                "LEFT JOIN member_profiles p ON p.member_id=m.id AND p.organisation_id=m.organisation_id "
                "WHERE m.organisation_id=? AND m.deleted_at IS NULL")
         params = [org]
@@ -95,66 +118,93 @@ class Database:
             sql += " AND m.status=?"; params.append(status)
         if search:
             term = f"%{search}%"
-            sql += " AND (u.display_name LIKE ? OR u.email LIKE ? OR COALESCE(m.title,'') LIKE ?)"
+            sql += " AND (COALESCE(p.display_name,u.display_name,'') LIKE ? OR COALESCE(p.email,u.email,'') LIKE ? OR COALESCE(m.title,'') LIKE ?)"
             params.extend((term, term, term))
-        return [dict(row) for row in self.execute(sql + " ORDER BY u.display_name, m.id", params)]
+        return [dict(row) for row in self.execute(sql + " ORDER BY display_name, m.id", params)]
 
     def member_profile(self, org, member_id):
-        members = self.list_members(org)
-        return next((member for member in members if member["id"] == member_id), None)
+        return next((member for member in self.list_members(org) if member["id"] == member_id), None)
 
-    def create_member(self, org, actor, email, display_name, title=None, profile=None):
-        self._require_member(org, actor)
-        if not isinstance(email, str) or not email or not isinstance(display_name, str) or not display_name:
-            raise ValueError("email and display_name are required")
-        profile = profile or {}
+    @staticmethod
+    def _validate_member_profile(profile):
         if not isinstance(profile, dict):
             raise ValueError("profile must be an object")
-        user = self.execute("SELECT id FROM users WHERE email=? AND deleted_at IS NULL", (email,)).fetchone()
-        timestamp = now()
-        if user:
-            user_id = user["id"]
-        else:
-            # A provisioned account cannot authenticate until its password is set.
-            user_id = uid()
-            self.execute("INSERT INTO users VALUES(?,?,?,?,?,?,NULL)",
-                         (user_id, email, "!", display_name, timestamp, timestamp))
-        member_id = uid()
+        allowed = {key: profile[key] for key in ("display_name", "email", "phone", "address", "biography", "profile_image_url", "term_starts_on", "term_ends_on") if key in profile}
+        for key, value in allowed.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"invalid {key}")
+        for key in ("term_starts_on", "term_ends_on"):
+            if allowed.get(key):
+                try:
+                    datetime.fromisoformat(allowed[key]).date()
+                except ValueError as exc:
+                    raise ValueError(f"invalid {key}") from exc
+        if allowed.get("term_starts_on") and allowed.get("term_ends_on") and allowed["term_starts_on"] > allowed["term_ends_on"]:
+            raise ValueError("term end must not precede term start")
+        return allowed
+
+    def create_member(self, org, actor, email=None, display_name=None, title=None, profile=None, user_id=None):
+        self._require_member(org, actor)
+        profile = dict(profile or {})
+        if display_name is not None:
+            profile.setdefault("display_name", display_name)
+        if email is not None:
+            profile.setdefault("email", email)
+        profile = self._validate_member_profile(profile)
+        if not profile.get("display_name"):
+            raise ValueError("display_name is required")
+        if user_id is None and profile.get("email"):
+            user = self.execute("SELECT id FROM users WHERE email=? AND deleted_at IS NULL", (profile["email"],)).fetchone()
+            user_id = user["id"] if user else None
+        elif user_id is not None and not self.execute("SELECT 1 FROM users WHERE id=? AND deleted_at IS NULL", (user_id,)).fetchone():
+            raise ValueError("unknown user")
+        timestamp, member_id = now(), uid()
         try:
-            self.execute("INSERT INTO members VALUES(?,?,?,?,?,?,?,NULL)",
+            self.execute("INSERT INTO members(id,organisation_id,user_id,title,status,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,NULL)",
                          (member_id, org, user_id, title, "active", timestamp, timestamp))
         except sqlite3.IntegrityError as exc:
             raise ValueError("user is already a member of this organisation") from exc
-        self.execute("INSERT INTO member_profiles VALUES(?,?,?,?,?,?,?)",
-                     (member_id, org, profile.get("phone"), profile.get("address"),
-                      profile.get("biography"), timestamp, timestamp))
-        self.conn.commit(); self.audit(org, actor, "member.created", "member", member_id)
+        self.execute("INSERT INTO member_profiles(member_id,organisation_id,display_name,email,phone,address,biography,profile_image_url,term_starts_on,term_ends_on,deactivated_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (member_id, org, profile["display_name"], profile.get("email"), profile.get("phone"), profile.get("address"), profile.get("biography"), profile.get("profile_image_url"), profile.get("term_starts_on"), profile.get("term_ends_on"), None, timestamp, timestamp))
+        self.conn.commit(); self.audit(org, actor, "member.created", "member", member_id, {"user_id": user_id})
         return member_id
 
     def update_member(self, org, actor, member_id, fields):
         self._require_member(org, actor); self._require_member(org, member_id)
         if not isinstance(fields, dict): raise ValueError("member fields must be an object")
-        member = self.member_profile(org, member_id)
         changed = False
-        if "display_name" in fields:
-            if not isinstance(fields["display_name"], str) or not fields["display_name"]: raise ValueError("invalid display_name")
-            self.execute("UPDATE users SET display_name=?,updated_at=? WHERE id=?", (fields["display_name"], now(), member["user_id"])); changed = True
         if "title" in fields:
             self.execute("UPDATE members SET title=?,updated_at=? WHERE id=? AND organisation_id=?", (fields["title"], now(), member_id, org)); changed = True
-        profile = fields.get("profile", {key: fields[key] for key in ("phone", "address", "biography") if key in fields})
+        profile = dict(fields.get("profile", {}))
+        profile.update({key: fields[key] for key in ("display_name", "email", "phone", "address", "biography", "profile_image_url", "term_starts_on", "term_ends_on") if key in fields})
         if profile:
-            if not isinstance(profile, dict): raise ValueError("profile must be an object")
-            allowed = {key: profile[key] for key in ("phone", "address", "biography") if key in profile}
-            if allowed:
+            allowed = self._validate_member_profile(profile)
+            existing = self.member_profile(org, member_id)
+            start = allowed.get("term_starts_on", existing["term_starts_on"])
+            end = allowed.get("term_ends_on", existing["term_ends_on"])
+            if start and end and start > end: raise ValueError("term end must not precede term start")
+            profile_exists = self.execute(
+                "SELECT 1 FROM member_profiles WHERE member_id=? AND organisation_id=?", (member_id, org)
+            ).fetchone()
+            if profile_exists:
                 assignments = ",".join(f"{key}=?" for key in allowed)
-                self.execute(f"UPDATE member_profiles SET {assignments},updated_at=? WHERE member_id=? AND organisation_id=?", (*allowed.values(), now(), member_id, org)); changed = True
+                self.execute(f"UPDATE member_profiles SET {assignments},updated_at=? WHERE member_id=? AND organisation_id=?", (*allowed.values(), now(), member_id, org))
+            else:
+                # Backfill a legacy membership on its first profile edit without
+                # altering the membership or its governance/audit history.
+                values = {key: allowed.get(key, existing.get(key)) for key in ("display_name", "email", "phone", "address", "biography", "profile_image_url", "term_starts_on", "term_ends_on")}
+                self.execute("INSERT INTO member_profiles(member_id,organisation_id,display_name,email,phone,address,biography,profile_image_url,term_starts_on,term_ends_on,deactivated_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (member_id, org, values["display_name"], values["email"], values["phone"], values["address"], values["biography"], values["profile_image_url"], values["term_starts_on"], values["term_ends_on"], existing["deactivated_at"], now(), now()))
+            changed = True
         if changed: self.conn.commit(); self.audit(org, actor, "member.updated", "member", member_id)
         return self.member_profile(org, member_id)
 
     def deactivate_member(self, org, actor, member_id):
         self._require_member(org, actor); self._require_member(org, member_id)
-        self.execute("UPDATE members SET status='inactive',updated_at=? WHERE id=? AND organisation_id=?", (now(), member_id, org))
-        self.conn.commit(); self.audit(org, actor, "member.deactivated", "member", member_id)
+        timestamp = now()
+        self.execute("UPDATE members SET status='inactive',updated_at=? WHERE id=? AND organisation_id=?", (timestamp, member_id, org))
+        self.execute("UPDATE member_profiles SET deactivated_at=?,updated_at=? WHERE member_id=? AND organisation_id=?", (timestamp, timestamp, member_id, org))
+        self.conn.commit(); self.audit(org, actor, "member.deactivated", "member", member_id, {"deactivated_at": timestamp})
 
     def assign_member_role(self, org, actor, member_id, role_id):
         self._require_member(org, actor); self._require_member(org, member_id)
@@ -276,12 +326,20 @@ class Database:
     def quorum(self, org, meeting_id):
         meeting = self._require_meeting(org, meeting_id)
         eligible = self.execute(
-            "SELECT count(*) n FROM meeting_attendees WHERE meeting_id=? AND organisation_id=? "
-            "AND observer=0 AND deleted_at IS NULL", (meeting_id, org),
+            "SELECT count(*) n FROM meeting_attendees a WHERE meeting_id=? AND organisation_id=? "
+            "AND observer=0 AND deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND c.agenda_item_id IS NULL AND c.status IN ('recusal_required','recusal_approved') "
+            "AND c.deleted_at IS NULL)", (meeting_id, org, org),
         ).fetchone()["n"]
         present = self.execute(
-            "SELECT count(*) n FROM meeting_attendees WHERE meeting_id=? AND organisation_id=? "
-            "AND observer=0 AND status='present' AND deleted_at IS NULL", (meeting_id, org),
+            "SELECT count(*) n FROM meeting_attendees a WHERE meeting_id=? AND organisation_id=? "
+            "AND observer=0 AND status='present' AND deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND c.agenda_item_id IS NULL AND c.status IN ('recusal_required','recusal_approved') "
+            "AND c.deleted_at IS NULL)", (meeting_id, org, org),
         ).fetchone()["n"]
         # A meeting with no eligible attendees cannot be quorate.  Ceiling is
         # required so (for example) 50% of three members is two, not one.
@@ -377,6 +435,41 @@ class Database:
                    {"meeting_id": meeting_id, "member_id": member_id, "agenda_item_id": agenda_id})
         return conflict_id
 
+    def manage_conflict_recusal(self, org, actor, meeting_id, conflict_id, status):
+        """Record the Chairperson or Secretariat's recusal decision for a conflict."""
+        if status not in {"recusal_required", "recusal_approved"}:
+            raise ValueError("invalid recusal status")
+        self._require_meeting(org, meeting_id)
+        result = self.execute(
+            "UPDATE conflict_declarations SET status=?,management_action=?,updated_at=? "
+            "WHERE id=? AND meeting_id=? AND organisation_id=? AND deleted_at IS NULL",
+            (status, status.replace("_", " "), now(), conflict_id, meeting_id, org),
+        )
+        if result.rowcount != 1:
+            raise ValueError("conflict outside tenant/meeting")
+        self.conn.commit()
+        self.audit(org, actor, "conflict.recusal_managed", "conflict", conflict_id,
+                   {"meeting_id": meeting_id, "status": status})
+
+    def _vote_quorum(self, org, meeting_id, agenda_id):
+        """Return quorum counts for a motion, excluding applicable recusals."""
+        meeting = self._require_meeting(org, meeting_id)
+        where = (
+            " FROM meeting_attendees a WHERE a.meeting_id=? AND a.organisation_id=? "
+            "AND a.observer=0 AND a.deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND (c.agenda_item_id IS NULL OR c.agenda_item_id=?) "
+            "AND c.status IN ('recusal_required','recusal_approved') AND c.deleted_at IS NULL)"
+        )
+        eligible = self.execute("SELECT count(*) n" + where,
+                                (meeting_id, org, org, agenda_id)).fetchone()["n"]
+        present = self.execute("SELECT count(*) n" + where + " AND a.status='present'",
+                               (meeting_id, org, org, agenda_id)).fetchone()["n"]
+        required = (eligible * meeting["quorum_percent"] + 99) // 100
+        return {"eligible": eligible, "present": present, "required": required,
+                "met": eligible > 0 and present >= required}
+
     def create_motion(self, org, actor, meeting_id, agenda_id, proposer_id, text):
         self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
         self._require_member(org, proposer_id)
@@ -398,14 +491,24 @@ class Database:
                               "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
         if not motion: raise ValueError("motion outside tenant/meeting")
         if motion["status"] != "open": raise ValueError("motion is not open for voting")
-        eligible = self.execute("SELECT 1 FROM meeting_attendees WHERE meeting_id=? AND member_id=? "
-                                "AND organisation_id=? AND status='present' AND observer=0 AND deleted_at IS NULL",
-                                (meeting_id, member_id, org)).fetchone()
-        if not eligible: raise ValueError("only present, non-observer attendees may vote")
+        eligible = self.execute(
+            "SELECT 1 FROM meeting_attendees a WHERE a.meeting_id=? AND a.member_id=? "
+            "AND a.organisation_id=? AND a.status='present' AND a.observer=0 AND a.deleted_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND (c.agenda_item_id IS NULL OR c.agenda_item_id=?) "
+            "AND c.status IN ('recusal_required','recusal_approved') AND c.deleted_at IS NULL)",
+            (meeting_id, member_id, org, org, motion["agenda_item_id"]),
+        ).fetchone()
+        if not eligible: raise ValueError("only present, non-recused, non-observer attendees may vote")
         timestamp = now()
-        self.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?) ON CONFLICT(motion_id,member_id) DO UPDATE SET "
-                     "choice=excluded.choice,cast_at=excluded.cast_at,updated_at=excluded.updated_at",
-                     (uid(), org, motion_id, member_id, choice, timestamp, timestamp))
+        try:
+            self.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?)",
+                         (uid(), org, motion_id, member_id, choice, timestamp, timestamp))
+        except sqlite3.IntegrityError as exc:
+            if "votes.motion_id, votes.member_id" in str(exc):
+                raise DuplicateVoteError("a vote has already been cast for this motion") from exc
+            raise
         self.conn.commit(); self.audit(org, actor, "vote.cast", "motion", motion_id,
                                        {"member_id": member_id, "choice": choice})
 
@@ -414,10 +517,15 @@ class Database:
                               "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
         if not motion: raise ValueError("motion outside tenant/meeting")
         counts = {row["choice"]: row["n"] for row in self.execute(
-            "SELECT choice,count(*) n FROM votes WHERE motion_id=? AND organisation_id=? GROUP BY choice",
-            (motion_id, org))}
+            "SELECT v.choice,count(*) n FROM votes v WHERE v.motion_id=? AND v.organisation_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=? AND c.member_id=v.member_id "
+            "AND (c.agenda_item_id IS NULL OR c.agenda_item_id=?) "
+            "AND c.status IN ('recusal_required','recusal_approved') AND c.deleted_at IS NULL) "
+            "GROUP BY v.choice",
+            (motion_id, org, org, meeting_id, motion["agenda_item_id"]))}
         tally = {choice: counts.get(choice, 0) for choice in ("for", "against", "abstain")}
-        quorum = self.quorum(org, meeting_id)
+        quorum = self._vote_quorum(org, meeting_id, motion["agenda_item_id"])
         tally.update({"eligible": quorum["eligible"], "quorum_met": quorum["met"],
                       "passed": quorum["met"] and tally["for"] > tally["against"]})
         return tally

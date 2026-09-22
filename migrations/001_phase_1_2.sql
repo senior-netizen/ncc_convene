@@ -1,10 +1,18 @@
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS organisations (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
+-- Kept separate from organisations so this migration remains compatible with an
+-- already-created base organisations table.  These fields are organisation-owned,
+-- rather than being supplied by an untrusted request.
+CREATE TABLE IF NOT EXISTS organisation_profiles (organisation_id TEXT PRIMARY KEY REFERENCES organisations(id), legal_name TEXT, registration_number TEXT, contact_email TEXT, contact_phone TEXT, address TEXT, website TEXT, logo_url TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_organisation_profiles_tenant ON organisation_profiles(organisation_id);
 CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, display_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
-CREATE TABLE IF NOT EXISTS members (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), user_id TEXT NOT NULL REFERENCES users(id), title TEXT, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, UNIQUE(organisation_id,user_id));
--- Keep optional, organisation-scoped contact details separate from the account record.
--- This preserves a user's identity when they hold memberships in more than one organisation.
-CREATE TABLE IF NOT EXISTS member_profiles (member_id TEXT PRIMARY KEY REFERENCES members(id), organisation_id TEXT NOT NULL REFERENCES organisations(id), phone TEXT, address TEXT, biography TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- A member may be an unprovisioned governance participant.  user_id is nullable
+-- so account provisioning is not required to retain their membership history.
+CREATE TABLE IF NOT EXISTS members (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), user_id TEXT REFERENCES users(id), title TEXT, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, UNIQUE(organisation_id,user_id));
+-- Member identity/contact belongs to the organisation, not the optional user account.
+-- Keeping it in a one-to-one table makes the added fields safe for deployments that
+-- already have the original members table and preserves a member after deactivation.
+CREATE TABLE IF NOT EXISTS member_profiles (member_id TEXT PRIMARY KEY REFERENCES members(id), organisation_id TEXT NOT NULL REFERENCES organisations(id), display_name TEXT NOT NULL, email TEXT, phone TEXT, address TEXT, biography TEXT, profile_image_url TEXT, term_starts_on TEXT, term_ends_on TEXT, deactivated_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_member_profiles_tenant ON member_profiles(organisation_id, member_id);
 CREATE TABLE IF NOT EXISTS roles (id TEXT PRIMARY KEY, organisation_id TEXT REFERENCES organisations(id), name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, UNIQUE(organisation_id,name));
 CREATE TABLE IF NOT EXISTS permissions (id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, description TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
@@ -26,7 +34,7 @@ CREATE TRIGGER IF NOT EXISTS audit_logs_immutable_delete BEFORE DELETE ON audit_
 CREATE INDEX IF NOT EXISTS idx_meetings_tenant ON meetings(organisation_id, starts_at) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_logs(organisation_id, created_at);
 -- Workflow records are deliberately tenant-scoped and anchored to an agenda item.
-CREATE TABLE IF NOT EXISTS conflict_declarations (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), meeting_id TEXT NOT NULL REFERENCES meetings(id), agenda_item_id TEXT REFERENCES agenda_items(id), member_id TEXT NOT NULL REFERENCES members(id), interest TEXT NOT NULL, management_action TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('declared','acknowledged','managed')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
+CREATE TABLE IF NOT EXISTS conflict_declarations (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), meeting_id TEXT NOT NULL REFERENCES meetings(id), agenda_item_id TEXT REFERENCES agenda_items(id), member_id TEXT NOT NULL REFERENCES members(id), interest TEXT NOT NULL, management_action TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('declared','acknowledged','managed','recusal_required','recusal_approved')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS motions (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), meeting_id TEXT NOT NULL REFERENCES meetings(id), agenda_item_id TEXT NOT NULL REFERENCES agenda_items(id), proposer_member_id TEXT NOT NULL REFERENCES members(id), text TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','closed','withdrawn')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS votes (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), motion_id TEXT NOT NULL REFERENCES motions(id), member_id TEXT NOT NULL REFERENCES members(id), choice TEXT NOT NULL CHECK(choice IN ('for','against','abstain')), cast_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(motion_id,member_id));
 -- Per-organisation/year counters are incremented with a single UPSERT statement by

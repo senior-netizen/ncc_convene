@@ -1,7 +1,12 @@
+import os
+import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
-from app.auth import hash_password
-from app.db import Database, now, uid
+from app.auth import hash_password, token
+from app.db import Database, DuplicateVoteError, now, uid
 
 
 class WorkflowTests(unittest.TestCase):
@@ -12,6 +17,7 @@ class WorkflowTests(unittest.TestCase):
         self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)", (self.org, "One", "workflow", timestamp, timestamp))
         self.secretariat = self.member("secretariat@example.test")
         self.board = self.member("board@example.test")
+        self.unconflicted = self.member("unconflicted@example.test")
         self.db.conn.commit()
 
     def tearDown(self):
@@ -64,6 +70,61 @@ class WorkflowTests(unittest.TestCase):
         action = self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board, "Implement")
         with self.assertRaisesRegex(ValueError, "evidence"):
             self.db.complete_action(self.org, self.board, action)
+
+    def test_repeated_vote_is_rejected_without_changing_original_vote(self):
+        meeting, agenda, motion = self._open_motion_with_present_board_member()
+        self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "for")
+        original = self.db.execute("SELECT choice, cast_at, updated_at FROM votes WHERE motion_id=? AND member_id=?",
+                                   (motion, self.board)).fetchone()
+
+        with self.assertRaisesRegex(DuplicateVoteError, "already been cast"):
+            self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "against")
+
+        persisted = self.db.execute("SELECT choice, cast_at, updated_at FROM votes WHERE motion_id=? AND member_id=?",
+                                    (motion, self.board)).fetchone()
+        self.assertEqual(dict(persisted), dict(original))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM audit_logs WHERE event_type='vote.cast' AND resource_id=?",
+                                         (motion,)).fetchone()[0], 1)
+
+    def test_concurrent_votes_allow_only_one_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "votes.db")
+            self.db.conn.close()
+            self.db = Database(path)
+            timestamp = now()
+            self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)",
+                            (self.org, "One", "workflow", timestamp, timestamp))
+            self.secretariat = self.member("secretariat@example.test")
+            self.board = self.member("board@example.test")
+            self.db.conn.commit()
+            meeting, agenda, motion = self._open_motion_with_present_board_member()
+            barrier = threading.Barrier(2)
+
+            def submit(choice):
+                database = Database(path)
+                try:
+                    barrier.wait()
+                    database.cast_vote(self.org, self.board, meeting, motion, self.board, choice)
+                    return "created"
+                except DuplicateVoteError:
+                    return "duplicate"
+                finally:
+                    database.conn.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(submit, ("for", "against")))
+
+            self.assertCountEqual(outcomes, ("created", "duplicate"))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM votes WHERE motion_id=? AND member_id=?",
+                                             (motion, self.board)).fetchone()[0], 1)
+
+    def _open_motion_with_present_board_member(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.secretariat, meeting, self.board)
+        self.db.attendance(self.org, self.secretariat, meeting, self.board, "present")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda, self.board, "Approve")
+        return meeting, agenda, motion
 
     def test_zero_eligible_attendees_is_not_quorate(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
