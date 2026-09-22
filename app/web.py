@@ -7,7 +7,7 @@ from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
 from .auth import read_token, token, verify_password
-from .db import Database
+from .db import Database, DuplicateVoteError
 from .policy import allowed
 
 DB = Database(os.getenv("APP_DATABASE", ".data/ncc-convene.db"))
@@ -262,6 +262,8 @@ def app(env, start):
             if not own_or("evidence.write", action["owner_member_id"], "actions.write"): return send("403 Forbidden", {"error": "forbidden"})
             DB.complete_action(org, actor, parts[3]); return send("200 OK", {"ok": True})
         return send("404 Not Found", {"error": "not found"})
+    except DuplicateVoteError as exc:
+        return send("409 Conflict", {"error": str(exc)})
     except (KeyError, TypeError, ValueError) as exc:
         return send("400 Bad Request", {"error": str(exc) or "invalid request"})
 
