@@ -81,6 +81,88 @@ class Database:
         if not member:
             raise ValueError("member outside tenant")
 
+    def list_members(self, org, search=None, status=None):
+        """Return only members and profile data belonging to ``org``."""
+        sql = ("SELECT m.id,m.organisation_id,m.user_id,m.title,m.status,m.created_at,m.updated_at,"
+               "u.email,u.display_name,p.phone,p.address,p.biography "
+               "FROM members m JOIN users u ON u.id=m.user_id "
+               "LEFT JOIN member_profiles p ON p.member_id=m.id AND p.organisation_id=m.organisation_id "
+               "WHERE m.organisation_id=? AND m.deleted_at IS NULL")
+        params = [org]
+        if status:
+            if status not in {"active", "inactive"}:
+                raise ValueError("invalid member status")
+            sql += " AND m.status=?"; params.append(status)
+        if search:
+            term = f"%{search}%"
+            sql += " AND (u.display_name LIKE ? OR u.email LIKE ? OR COALESCE(m.title,'') LIKE ?)"
+            params.extend((term, term, term))
+        return [dict(row) for row in self.execute(sql + " ORDER BY u.display_name, m.id", params)]
+
+    def member_profile(self, org, member_id):
+        members = self.list_members(org)
+        return next((member for member in members if member["id"] == member_id), None)
+
+    def create_member(self, org, actor, email, display_name, title=None, profile=None):
+        self._require_member(org, actor)
+        if not isinstance(email, str) or not email or not isinstance(display_name, str) or not display_name:
+            raise ValueError("email and display_name are required")
+        profile = profile or {}
+        if not isinstance(profile, dict):
+            raise ValueError("profile must be an object")
+        user = self.execute("SELECT id FROM users WHERE email=? AND deleted_at IS NULL", (email,)).fetchone()
+        timestamp = now()
+        if user:
+            user_id = user["id"]
+        else:
+            # A provisioned account cannot authenticate until its password is set.
+            user_id = uid()
+            self.execute("INSERT INTO users VALUES(?,?,?,?,?,?,NULL)",
+                         (user_id, email, "!", display_name, timestamp, timestamp))
+        member_id = uid()
+        try:
+            self.execute("INSERT INTO members VALUES(?,?,?,?,?,?,?,NULL)",
+                         (member_id, org, user_id, title, "active", timestamp, timestamp))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("user is already a member of this organisation") from exc
+        self.execute("INSERT INTO member_profiles VALUES(?,?,?,?,?,?,?)",
+                     (member_id, org, profile.get("phone"), profile.get("address"),
+                      profile.get("biography"), timestamp, timestamp))
+        self.conn.commit(); self.audit(org, actor, "member.created", "member", member_id)
+        return member_id
+
+    def update_member(self, org, actor, member_id, fields):
+        self._require_member(org, actor); self._require_member(org, member_id)
+        if not isinstance(fields, dict): raise ValueError("member fields must be an object")
+        member = self.member_profile(org, member_id)
+        changed = False
+        if "display_name" in fields:
+            if not isinstance(fields["display_name"], str) or not fields["display_name"]: raise ValueError("invalid display_name")
+            self.execute("UPDATE users SET display_name=?,updated_at=? WHERE id=?", (fields["display_name"], now(), member["user_id"])); changed = True
+        if "title" in fields:
+            self.execute("UPDATE members SET title=?,updated_at=? WHERE id=? AND organisation_id=?", (fields["title"], now(), member_id, org)); changed = True
+        profile = fields.get("profile", {key: fields[key] for key in ("phone", "address", "biography") if key in fields})
+        if profile:
+            if not isinstance(profile, dict): raise ValueError("profile must be an object")
+            allowed = {key: profile[key] for key in ("phone", "address", "biography") if key in profile}
+            if allowed:
+                assignments = ",".join(f"{key}=?" for key in allowed)
+                self.execute(f"UPDATE member_profiles SET {assignments},updated_at=? WHERE member_id=? AND organisation_id=?", (*allowed.values(), now(), member_id, org)); changed = True
+        if changed: self.conn.commit(); self.audit(org, actor, "member.updated", "member", member_id)
+        return self.member_profile(org, member_id)
+
+    def deactivate_member(self, org, actor, member_id):
+        self._require_member(org, actor); self._require_member(org, member_id)
+        self.execute("UPDATE members SET status='inactive',updated_at=? WHERE id=? AND organisation_id=?", (now(), member_id, org))
+        self.conn.commit(); self.audit(org, actor, "member.deactivated", "member", member_id)
+
+    def assign_member_role(self, org, actor, member_id, role_id):
+        self._require_member(org, actor); self._require_member(org, member_id)
+        role = self.execute("SELECT 1 FROM roles WHERE id=? AND organisation_id=? AND deleted_at IS NULL", (role_id, org)).fetchone()
+        if not role: raise ValueError("role outside tenant")
+        self.execute("INSERT OR IGNORE INTO member_roles VALUES(?,?,?)", (member_id, role_id, now()))
+        self.conn.commit(); self.audit(org, actor, "member.role_assigned", "member", member_id, {"role_id": role_id})
+
     def create_meeting(self, org, actor, title, starts_at, location, **kw):
         self._require_member(org, actor)
         if not 1 <= kw.get("quorum_percent", 50) <= 100:
