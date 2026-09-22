@@ -8,6 +8,8 @@ Requires Python 3.11+ (no third-party runtime dependencies).
 
 ```bash
 python -m app.seed --database .data/ncc-convene.db
+# Repeatable development reset (preserves immutable audit history):
+python -m app.seed --database .data/ncc-convene.db --reset
 APP_DATABASE=.data/ncc-convene.db APP_SESSION_SECRET='replace-this-with-a-long-random-secret' python -m app.web
 # Open http://127.0.0.1:8000/login. Demo login: secretariat@ncc.example / ChangeMe123!
 python -m unittest discover -v
@@ -15,9 +17,19 @@ python -m unittest discover -v
 
 `APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Deploy behind HTTPS and set `APP_COOKIE_SECURE=1`.
 
-## Browser portal
+## Seeded demo
 
-The dependency-free server also renders a small browser portal. Sign in at `/login`; protected browser routes redirect unauthenticated visitors there. The portal provides `/dashboard`, `/members`, `/activity-log`, and `/administration`. Each page applies the same server-side permissions as the JSON API, and pages for unfinished functionality state that it is not available yet rather than implying that data exists.
+The seed command creates the NCC operating personas: `superadmin@ncc.example`,
+`orgadmin@ncc.example`, `secretariat@ncc.example`, and `observer@ncc.example`,
+as well as `chair@ncc.example` and `commissioner01@ncc.example` through
+`commissioner16@ncc.example`. Every demo account uses `ChangeMe123!` and must
+be changed before any non-demo deployment. It includes the 17-member board, a
+hybrid 24 September 2026 meeting, eight agenda items, four board papers and
+participant RSVP/attendance data.
+
+`--reset` is allowed in `APP_ENV=development`, `dev`, or `test` (the default is
+development). In another environment application code must call `seed` with an
+existing NCC Super Admin member ID; the command-line reset is therefore refused.
 
 ## API demo path
 
