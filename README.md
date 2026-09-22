@@ -11,7 +11,7 @@ python -m app.seed --database .data/ncc-convene.db
 # Repeatable development reset (preserves immutable audit history):
 python -m app.seed --database .data/ncc-convene.db --reset
 APP_DATABASE=.data/ncc-convene.db APP_SESSION_SECRET='replace-this-with-a-long-random-secret' python -m app.web
-# Open http://127.0.0.1:8000. Demo login: secretariat@ncc.example / ChangeMe123!
+# Open http://127.0.0.1:8000/login. Demo login: secretariat@ncc.example / ChangeMe123!
 python -m unittest discover -v
 ```
 

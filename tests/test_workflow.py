@@ -1,7 +1,12 @@
+import os
+import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
-from app.auth import hash_password
-from app.db import Database, now, uid
+from app.auth import hash_password, token
+from app.db import Database, DuplicateVoteError, now, uid
 
 
 class WorkflowTests(unittest.TestCase):
@@ -12,6 +17,7 @@ class WorkflowTests(unittest.TestCase):
         self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)", (self.org, "One", "workflow", timestamp, timestamp))
         self.secretariat = self.member("secretariat@example.test")
         self.board = self.member("board@example.test")
+        self.unconflicted = self.member("unconflicted@example.test")
         self.db.conn.commit()
 
     def tearDown(self):
@@ -65,9 +71,99 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence"):
             self.db.complete_action(self.org, self.board, action)
 
+    def test_repeated_vote_is_rejected_without_changing_original_vote(self):
+        meeting, agenda, motion = self._open_motion_with_present_board_member()
+        self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "for")
+        original = self.db.execute("SELECT choice, cast_at, updated_at FROM votes WHERE motion_id=? AND member_id=?",
+                                   (motion, self.board)).fetchone()
+
+        with self.assertRaisesRegex(DuplicateVoteError, "already been cast"):
+            self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "against")
+
+        persisted = self.db.execute("SELECT choice, cast_at, updated_at FROM votes WHERE motion_id=? AND member_id=?",
+                                    (motion, self.board)).fetchone()
+        self.assertEqual(dict(persisted), dict(original))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM audit_logs WHERE event_type='vote.cast' AND resource_id=?",
+                                         (motion,)).fetchone()[0], 1)
+
+    def test_concurrent_votes_allow_only_one_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "votes.db")
+            self.db.conn.close()
+            self.db = Database(path)
+            timestamp = now()
+            self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)",
+                            (self.org, "One", "workflow", timestamp, timestamp))
+            self.secretariat = self.member("secretariat@example.test")
+            self.board = self.member("board@example.test")
+            self.db.conn.commit()
+            meeting, agenda, motion = self._open_motion_with_present_board_member()
+            barrier = threading.Barrier(2)
+
+            def submit(choice):
+                database = Database(path)
+                try:
+                    barrier.wait()
+                    database.cast_vote(self.org, self.board, meeting, motion, self.board, choice)
+                    return "created"
+                except DuplicateVoteError:
+                    return "duplicate"
+                finally:
+                    database.conn.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(submit, ("for", "against")))
+
+            self.assertCountEqual(outcomes, ("created", "duplicate"))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM votes WHERE motion_id=? AND member_id=?",
+                                             (motion, self.board)).fetchone()[0], 1)
+
+    def _open_motion_with_present_board_member(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.secretariat, meeting, self.board)
+        self.db.attendance(self.org, self.secretariat, meeting, self.board, "present")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda, self.board, "Approve")
+        return meeting, agenda, motion
+
     def test_zero_eligible_attendees_is_not_quorate(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         self.assertEqual(self.db.quorum(self.org, meeting), {"eligible": 0, "present": 0, "required": 0, "met": False})
+
+    def test_numbered_traceable_records_and_structured_minutes(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        minute = self.db.save_minutes(self.org, self.secretariat, meeting, agenda, "Summary", "in_review")
+        item = self.db.add_minute_item(self.org, self.secretariat, minute, "decision", "Approved", 0)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM minute_items WHERE id=?", (item,)).fetchone())
+
+        resolution = self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Noted", "noted")
+        resolution_record = self.db.resolution_traceability(self.org, resolution)[0]
+        self.assertEqual((resolution_record["resolution_year"], resolution_record["resolution_number"]), (2026, 1))
+
+        action = self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board,
+                                       "Implement", "2001-01-01T00:00:00Z", resolution, "high")
+        action_record = self.db.action_traceability(self.org, action)[0]
+        self.assertEqual((action_record["action_year"], action_record["action_number"]), (2026, 1))
+        self.assertEqual(action_record["priority"], "high")
+        self.assertEqual(action_record["is_overdue"], 1)
+        update = self.db.add_action_update(self.org, self.board, action, "Started", "in_progress")
+        self.assertEqual(self.db.action_traceability(self.org, action)[0]["update_count"], 1)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM action_updates WHERE id=?", (update,)).fetchone())
+        with self.assertRaisesRegex(ValueError, "due_at"):
+            self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board, "Bad date", "tomorrow")
+
+    def test_carried_motion_cannot_generate_two_carried_resolutions(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.secretariat, meeting, self.secretariat)
+        self.db.attendance(self.org, self.secretariat, meeting, self.secretariat, "present")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda, self.secretariat, "Approve")
+        self.db.cast_vote(self.org, self.secretariat, meeting, motion, self.secretariat, "for")
+        self.db.close_motion(self.org, self.secretariat, meeting, motion)
+        self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Approved", "carried", motion)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Approved again", "carried", motion)
 
 
 if __name__ == "__main__":
