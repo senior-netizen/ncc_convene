@@ -44,6 +44,11 @@ def html_send(start, status, content, headers=()):
     return [content.encode("utf-8")]
 
 
+def binary_send(start, status, content, content_type, headers=()):
+    start(status, [("Content-Type", content_type), ("Content-Length", str(len(content))), *headers])
+    return [content]
+
+
 def login_page(message=""):
     notice = f'<p role="alert">{escape(message)}</p>' if message else ""
     return page("Sign in", f"""<h1>Sign in</h1>{notice}
@@ -151,6 +156,43 @@ def app(env, start):
             else:
                 content = "<h1>Dashboard</h1><div class=\"empty\"><h2>No meetings yet</h2><p>Scheduled meetings will appear here when this module is used.</p></div>"
             return html_send(start, "200 OK", page("Dashboard", content, session, roles))
+        if browser and path.startswith('/documents/') and path.endswith('/download') and method == 'GET':
+            denied = browser_require('documents.read')
+            if denied: return denied
+            document_id = path.strip('/').split('/')[1]
+            document = DB.execute('SELECT d.title,v.storage_key,v.content_type,v.version_number FROM documents d JOIN document_versions v ON v.document_id=d.id AND v.organisation_id=d.organisation_id WHERE d.id=? AND d.organisation_id=? AND d.deleted_at IS NULL AND v.version_number=(SELECT max(v2.version_number) FROM document_versions v2 WHERE v2.document_id=d.id AND v2.organisation_id=?)', (document_id, org, org)).fetchone()
+            if not document or not Path(document['storage_key']).is_file():
+                return html_send(start, '404 Not Found', page('Document unavailable', '<h1>Document unavailable</h1><p>This board paper is not available.</p>', session, roles))
+            content_type = document['content_type'] or 'application/octet-stream'
+            return binary_send(start, '200 OK', Path(document['storage_key']).read_bytes(), content_type, [('Content-Disposition', f'inline; filename="{escape(document["title"])}"')])
+        if browser and path.startswith('/documents/') and path.endswith('/versions') and method == 'GET':
+            denied = browser_require('documents.read')
+            if denied: return denied
+            document_id = path.strip('/').split('/')[1]
+            versions = DB.execute('SELECT version_number,size_bytes,sha256,content_type,created_at FROM document_versions WHERE document_id=? AND organisation_id=? ORDER BY version_number DESC', (document_id, org)).fetchall()
+            rows = ''.join(f'<tr><td>{v["version_number"]}</td><td>{v["size_bytes"]} bytes</td><td>{escape(v["content_type"] or "")}</td><td>{escape(v["created_at"])}</td><td><code>{escape(v["sha256"][:12])}…</code></td></tr>' for v in versions)
+            content = f'<h1>Document versions</h1><table><tr><th>Version</th><th>Size</th><th>Type</th><th>Uploaded</th><th>SHA-256</th></tr>{rows}</table>'
+            return html_send(start, '200 OK', page('Document versions', content, session, roles))
+        if browser and method == 'POST' and path.startswith('/meetings/') and path.endswith('/documents'):
+            denied = browser_require('documents.write')
+            if denied: return denied
+            meeting_id = path.strip('/').split('/')[1]
+            data = browser_body(env)
+            try:
+                document_id = DB.add_document(org, actor, data.get('title', '').strip(), data.get('content', '').encode('utf-8'), meeting_id, data.get('agenda_item_id') or None, data.get('classification', 'internal'), data.get('content_type') or 'text/plain')
+            except (KeyError, ValueError) as exc:
+                return html_send(start, '400 Bad Request', page('Upload failed', f'<h1>Upload failed</h1><p>{escape(str(exc))}</p>', session, roles))
+            return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting_id}')])
+        if browser and method == 'POST' and path.startswith('/meetings/') and path.endswith('/agenda'):
+            denied = browser_require('agenda.write')
+            if denied: return denied
+            meeting_id = path.strip('/').split('/')[1]
+            data = browser_body(env)
+            try:
+                DB.add_agenda(org, actor, meeting_id, data.get('title', '').strip(), int(data.get('position', '1')), data.get('parent_id') or None)
+            except (KeyError, ValueError) as exc:
+                return html_send(start, '400 Bad Request', page('Agenda update failed', f'<h1>Agenda update failed</h1><p>{escape(str(exc))}</p>', session, roles))
+            return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting_id}#agenda')])
         if browser and method == "GET" and path.startswith("/meetings/") and len(path.strip('/').split('/')) == 2:
             denied = browser_require('meetings.read')
             if denied: return denied
@@ -162,14 +204,20 @@ def app(env, start):
             participants = DB.execute('SELECT a.*, COALESCE(p.display_name,u.display_name) name FROM meeting_attendees a JOIN members m ON m.id=a.member_id LEFT JOIN member_profiles p ON p.member_id=m.id LEFT JOIN users u ON u.id=m.user_id WHERE a.organisation_id=? AND a.meeting_id=? AND a.deleted_at IS NULL ORDER BY name', (org, meeting_id))
             q = DB.quorum(org, meeting_id)
             agenda_rows = ''.join(f'<li>{escape(row["title"])} </li>' for row in agenda)
-            paper_rows = ''.join(f'<tr><td>{escape(row["title"])}</td><td>{escape(row["classification"])}</td><td>{row["version_number"] or 0}</td><td>{row["size_bytes"] or 0} bytes</td></tr>' for row in papers)
+            paper_rows = ''.join(f'<tr><td>{escape(row["title"])}</td><td>{escape(row["classification"])}</td><td>{row["version_number"] or 0}</td><td>{row["size_bytes"] or 0} bytes</td><td><a href="/documents/{row["id"]}/download">View/download</a> · <a href="/documents/{row["id"]}/versions">Versions</a></td></tr>' for row in papers)
+            paper_form = ''
+            if allowed(roles, 'documents.write'):
+                paper_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/documents"><h3>Upload board paper</h3><label>Title <input name="title" required></label><label>Content type <input name="content_type" value="text/plain"></label><label>Classification <select name="classification"><option>internal</option><option>confidential</option><option>public</option></select></label><label>Content <textarea name="content" rows="6" required></textarea></label><button type="submit">Upload paper</button></form>'
+            agenda_form = ''
+            if allowed(roles, 'agenda.write'):
+                agenda_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/agenda"><h3>Add agenda item</h3><label>Title <input name="title" required></label><label>Position <input name="position" type="number" min="1" value="{len(agenda) + 1}" required></label><button type="submit">Add item</button></form>'
             participant_rows = ''.join(f'<tr><td>{escape(row["name"] or "")}</td><td>{"Observer" if row["observer"] else "Member"}</td><td>{escape(row["status"])}</td></tr>' for row in participants)
             join = ''
             if meeting['video_metadata'] and allowed(roles, 'meetings.read'):
                 try: join_url = json.loads(meeting['video_metadata']).get('url')
                 except (TypeError, ValueError): join_url = None
                 if join_url: join = f'<p><a href="{escape(join_url)}">Join Meeting</a></p>'
-            content = f'''<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong> (required {q["required"]})</p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol></section><section id="papers"><h2>Board papers ({len(list(DB.execute("SELECT 1 FROM documents WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL", (org, meeting_id))))})</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th></tr>{paper_rows}</table></section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table></section><section id="conflicts"><h2>Conflicts</h2><p>Conflict declarations and recusal decisions are recorded through the secured API workflow.</p></section><section id="motions"><h2>Motions & voting</h2><p>Open motions, vote eligibility and immutable ballots are available through the secured workflow.</p></section><section id="resolutions"><h2>Resolutions</h2><p>Resolution traceability is maintained for this meeting.</p></section><section id="minutes"><h2>Minutes</h2><p>Structured minutes are maintained per agenda item.</p></section><section id="actions"><h2>Actions</h2><p>Open actions: {len([a for a in DB.action_traceability(org) if a["meeting_id"] == meeting_id and a["status"] in ("open", "in_progress")])}</p></section>'''
+            content = f'''<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong> (required {q["required"]})</p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol>{agenda_form}</section><section id="papers"><h2>Board papers ({len(list(DB.execute("SELECT 1 FROM documents WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL", (org, meeting_id))))})</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th><th>Access</th></tr>{paper_rows}</table>{paper_form}</section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table></section><section id="conflicts"><h2>Conflicts</h2><p>Conflict declarations and recusal decisions are recorded through the secured API workflow.</p></section><section id="motions"><h2>Motions & voting</h2><p>Open motions, vote eligibility and immutable ballots are available through the secured workflow.</p></section><section id="resolutions"><h2>Resolutions</h2><p>Resolution traceability is maintained for this meeting.</p></section><section id="minutes"><h2>Minutes</h2><p>Structured minutes are maintained per agenda item.</p></section><section id="actions"><h2>Actions</h2><p>Open actions: {len([a for a in DB.action_traceability(org) if a["meeting_id"] == meeting_id and a["status"] in ("open", "in_progress")])}</p></section>'''
             return html_send(start, '200 OK', page('Meeting workspace', content, session, roles))
         if browser and method == "GET" and path == "/members":
             denied = browser_require("members.read")
