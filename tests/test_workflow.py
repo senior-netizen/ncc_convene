@@ -55,6 +55,15 @@ class WorkflowTests(unittest.TestCase):
         for resource_id in (paper, conflict, motion, resolution, minutes, action, evidence):
             self.assertIsNotNone(self.db.execute("SELECT 1 FROM audit_logs WHERE resource_id=?", (resource_id,)).fetchone())
 
+    def test_in_progress_action_can_complete_with_evidence(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        action = self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board, "Implement")
+        self.db.add_action_update(self.org, self.board, action, "Started", "in_progress")
+        self.db.add_completion_evidence(self.org, self.board, action, "Complete evidence")
+        self.db.complete_action(self.org, self.board, action)
+        self.assertEqual(self.db.action_traceability(self.org, action)[0]["status"], "completed")
+
     def test_vote_and_completion_edge_cases_are_rejected(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)

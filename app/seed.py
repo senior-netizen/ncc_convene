@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import os
 import uuid
+from pathlib import Path
 
 from .auth import hash_password
 from .db import Database
@@ -163,10 +164,12 @@ def seed(db, *, reset=False, actor_member_id=None, development=None):
                    "status=excluded.status,updated_at=excluded.updated_at,deleted_at=NULL",
                    (document_id, ORGANISATION_ID, MEETING_ID, agenda_ids[position], title, "board", "published",
                     secretary, SEED_TIME, SEED_TIME))
+        seeded_path = db._safe_upload_path(ORGANISATION_ID, document_id, version_id)
+        seeded_path.write_bytes(content)
         db.execute("INSERT INTO document_versions(id,organisation_id,document_id,version_number,storage_key,sha256,size_bytes,created_by,created_at,content_type) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(document_id,version_number) DO UPDATE SET "
                    "id=excluded.id,storage_key=excluded.storage_key,sha256=excluded.sha256,size_bytes=excluded.size_bytes,"
                    "created_by=excluded.created_by,created_at=excluded.created_at,content_type=excluded.content_type",
-                   (version_id, ORGANISATION_ID, document_id, 1, f"inline/{version_id}",
+                   (version_id, ORGANISATION_ID, document_id, 1, str(seeded_path),
                     hashlib.sha256(content).hexdigest(), len(content), secretary, SEED_TIME, "text/plain"))
     participants = board_emails + ("secretariat@ncc.example", "observer@ncc.example")
     responses = ("yes", "yes", "maybe", "yes", "no")
