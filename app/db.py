@@ -15,6 +15,10 @@ def uid():
     return str(uuid.uuid4())
 
 
+class DuplicateVoteError(ValueError):
+    """Raised when a member attempts to cast more than one vote on a motion."""
+
+
 class Database:
     """Tenant-scoped persistence operations for the NCC Convene application."""
 
@@ -380,9 +384,13 @@ class Database:
                                 (meeting_id, member_id, org)).fetchone()
         if not eligible: raise ValueError("only present, non-observer attendees may vote")
         timestamp = now()
-        self.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?) ON CONFLICT(motion_id,member_id) DO UPDATE SET "
-                     "choice=excluded.choice,cast_at=excluded.cast_at,updated_at=excluded.updated_at",
-                     (uid(), org, motion_id, member_id, choice, timestamp, timestamp))
+        try:
+            self.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?)",
+                         (uid(), org, motion_id, member_id, choice, timestamp, timestamp))
+        except sqlite3.IntegrityError as exc:
+            if "votes.motion_id, votes.member_id" in str(exc):
+                raise DuplicateVoteError("a vote has already been cast for this motion") from exc
+            raise
         self.conn.commit(); self.audit(org, actor, "vote.cast", "motion", motion_id,
                                        {"member_id": member_id, "choice": choice})
 

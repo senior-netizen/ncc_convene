@@ -1,7 +1,12 @@
+import os
+import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
-from app.auth import hash_password
-from app.db import Database, now, uid
+from app.auth import hash_password, token
+from app.db import Database, DuplicateVoteError, now, uid
 
 
 class WorkflowTests(unittest.TestCase):
@@ -65,9 +70,112 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence"):
             self.db.complete_action(self.org, self.board, action)
 
+    def test_repeated_vote_is_rejected_without_changing_original_vote(self):
+        meeting, agenda, motion = self._open_motion_with_present_board_member()
+        self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "for")
+        original = self.db.execute("SELECT choice, cast_at, updated_at FROM votes WHERE motion_id=? AND member_id=?",
+                                   (motion, self.board)).fetchone()
+
+        with self.assertRaisesRegex(DuplicateVoteError, "already been cast"):
+            self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "against")
+
+        persisted = self.db.execute("SELECT choice, cast_at, updated_at FROM votes WHERE motion_id=? AND member_id=?",
+                                    (motion, self.board)).fetchone()
+        self.assertEqual(dict(persisted), dict(original))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM audit_logs WHERE event_type='vote.cast' AND resource_id=?",
+                                         (motion,)).fetchone()[0], 1)
+
+    def test_concurrent_votes_allow_only_one_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "votes.db")
+            self.db.conn.close()
+            self.db = Database(path)
+            timestamp = now()
+            self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)",
+                            (self.org, "One", "workflow", timestamp, timestamp))
+            self.secretariat = self.member("secretariat@example.test")
+            self.board = self.member("board@example.test")
+            self.db.conn.commit()
+            meeting, agenda, motion = self._open_motion_with_present_board_member()
+            barrier = threading.Barrier(2)
+
+            def submit(choice):
+                database = Database(path)
+                try:
+                    barrier.wait()
+                    database.cast_vote(self.org, self.board, meeting, motion, self.board, choice)
+                    return "created"
+                except DuplicateVoteError:
+                    return "duplicate"
+                finally:
+                    database.conn.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(submit, ("for", "against")))
+
+            self.assertCountEqual(outcomes, ("created", "duplicate"))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM votes WHERE motion_id=? AND member_id=?",
+                                             (motion, self.board)).fetchone()[0], 1)
+
+    def _open_motion_with_present_board_member(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.secretariat, meeting, self.board)
+        self.db.attendance(self.org, self.secretariat, meeting, self.board, "present")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda, self.board, "Approve")
+        return meeting, agenda, motion
+
     def test_zero_eligible_attendees_is_not_quorate(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         self.assertEqual(self.db.quorum(self.org, meeting), {"eligible": 0, "present": 0, "required": 0, "met": False})
+
+
+class VoteApiTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["APP_DATABASE"] = ":memory:"
+        from app import web
+
+        self.web = web
+        self.db = Database()
+        self.web.DB = self.db
+        timestamp = now()
+        self.org, self.user, self.member_id = uid(), uid(), uid()
+        self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)",
+                        (self.org, "One", "vote-api", timestamp, timestamp))
+        self.db.execute("INSERT INTO users VALUES(?,?,?,?,?,?,NULL)",
+                        (self.user, "voter@example.test", hash_password("x"), "Voter", timestamp, timestamp))
+        self.db.execute("INSERT INTO members VALUES(?,?,?,?,?,?,?,NULL)",
+                        (self.member_id, self.org, self.user, None, "active", timestamp, timestamp))
+        role = uid()
+        self.db.execute("INSERT INTO roles VALUES(?,?,?,?,?,NULL)",
+                        (role, self.org, "Commissioner/Board Member", timestamp, timestamp))
+        self.db.execute("INSERT INTO member_roles VALUES(?,?,?)", (self.member_id, role, timestamp))
+        self.db.conn.commit()
+        self.meeting = self.db.create_meeting(self.org, self.member_id, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.member_id, self.meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.member_id, self.meeting, self.member_id)
+        self.db.attendance(self.org, self.member_id, self.meeting, self.member_id, "present")
+        self.motion = self.db.create_motion(self.org, self.member_id, self.meeting, agenda, self.member_id, "Approve")
+
+    def tearDown(self):
+        self.db.conn.close()
+
+    def test_duplicate_vote_returns_conflict(self):
+        self.assertEqual(self._cast_vote("for")[0], "200 OK")
+        status, body = self._cast_vote("against")
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body, b'{"error": "a vote has already been cast for this motion"}')
+
+    def _cast_vote(self, choice):
+        payload = ('{"choice": "' + choice + '"}').encode()
+        env = {
+            "PATH_INFO": f"/meetings/{self.meeting}/motions/{self.motion}/votes",
+            "REQUEST_METHOD": "POST", "CONTENT_LENGTH": str(len(payload)), "wsgi.input": BytesIO(payload),
+            "HTTP_COOKIE": f"session={token({'user': self.user, 'org': self.org, 'member': self.member_id}, self.web.SECRET)}",
+        }
+        received = []
+        body = b"".join(self.web.app(env, lambda status, headers: received.append((status, headers))))
+        return received[0][0], body
 
 
 if __name__ == "__main__":
