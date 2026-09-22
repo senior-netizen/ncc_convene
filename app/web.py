@@ -18,7 +18,7 @@ def app(env,start):
   if session: DB.audit(session['org'],session['member'],'logout','session')
   return send('200 OK',{'ok':True},[('Set-Cookie','session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/')])
  if not session: return send('401 Unauthorized',{'error':'authentication required'})
- roles=DB.roles(session['member'])
+ roles=DB.roles(session['member'], session['org'])
  def require(permission):
   if allowed(roles,permission): return True
   DB.audit(session['org'],session['member'],'access.denied','route',path,{'permission':permission}); return False
@@ -40,7 +40,12 @@ def app(env,start):
    if not require('meetings.write'): return send('403 Forbidden',{'error':'forbidden'})
    d=body(); DB.assign_attendee(session['org'],session['member'],meeting,d['member_id'],d.get('observer',False)); return send('200 OK',{'ok':True})
   if parts[2]=='rsvp' and method=='POST':
-   if not require('rsvp.write') and not require('attendance.write'): return send('403 Forbidden',{'error':'forbidden'})
-   d=body(); DB.rsvp(session['org'],session['member'],meeting,d.get('member_id',session['member']),d['response']); return send('200 OK',{'ok':True})
+   d=body(); member_id=d.get('member_id',session['member'])
+   can_manage=allowed(roles,'attendance.write')
+   can_respond=allowed(roles,'rsvp.write') and member_id==session['member']
+   if not (can_manage or can_respond):
+    DB.audit(session['org'],session['member'],'access.denied','route',path,{'permission':'rsvp.write'})
+    return send('403 Forbidden',{'error':'forbidden'})
+   DB.rsvp(session['org'],session['member'],meeting,member_id,d['response']); return send('200 OK',{'ok':True})
  return send('404 Not Found',{'error':'not found'})
 if __name__=='__main__': print('Serving on http://127.0.0.1:8000'); make_server('127.0.0.1',8000,app).serve_forever()
