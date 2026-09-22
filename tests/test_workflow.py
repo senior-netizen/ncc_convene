@@ -69,6 +69,41 @@ class WorkflowTests(unittest.TestCase):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         self.assertEqual(self.db.quorum(self.org, meeting), {"eligible": 0, "present": 0, "required": 0, "met": False})
 
+    def test_numbered_traceable_records_and_structured_minutes(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        minute = self.db.save_minutes(self.org, self.secretariat, meeting, agenda, "Summary", "in_review")
+        item = self.db.add_minute_item(self.org, self.secretariat, minute, "decision", "Approved", 0)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM minute_items WHERE id=?", (item,)).fetchone())
+
+        resolution = self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Noted", "noted")
+        resolution_record = self.db.resolution_traceability(self.org, resolution)[0]
+        self.assertEqual((resolution_record["resolution_year"], resolution_record["resolution_number"]), (2026, 1))
+
+        action = self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board,
+                                       "Implement", "2001-01-01T00:00:00Z", resolution, "high")
+        action_record = self.db.action_traceability(self.org, action)[0]
+        self.assertEqual((action_record["action_year"], action_record["action_number"]), (2026, 1))
+        self.assertEqual(action_record["priority"], "high")
+        self.assertEqual(action_record["is_overdue"], 1)
+        update = self.db.add_action_update(self.org, self.board, action, "Started", "in_progress")
+        self.assertEqual(self.db.action_traceability(self.org, action)[0]["update_count"], 1)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM action_updates WHERE id=?", (update,)).fetchone())
+        with self.assertRaisesRegex(ValueError, "due_at"):
+            self.db.create_action(self.org, self.secretariat, meeting, agenda, self.board, "Bad date", "tomorrow")
+
+    def test_carried_motion_cannot_generate_two_carried_resolutions(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
+        self.db.assign_attendee(self.org, self.secretariat, meeting, self.secretariat)
+        self.db.attendance(self.org, self.secretariat, meeting, self.secretariat, "present")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda, self.secretariat, "Approve")
+        self.db.cast_vote(self.org, self.secretariat, meeting, motion, self.secretariat, "for")
+        self.db.close_motion(self.org, self.secretariat, meeting, motion)
+        self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Approved", "carried", motion)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.db.create_resolution(self.org, self.secretariat, meeting, agenda, "Approved again", "carried", motion)
+
 
 if __name__ == "__main__":
     unittest.main()

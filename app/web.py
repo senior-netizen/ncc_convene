@@ -146,13 +146,22 @@ def app(env, start):
             return send("201 Created", {"id": DB.create_motion(org, actor, meeting_id, data["agenda_item_id"], data["proposer_member_id"], data["text"])})
         if resource == "resolutions" and method == "POST":
             if not require("resolutions.write"): return send("403 Forbidden", {"error": "forbidden"})
-            return send("201 Created", {"id": DB.create_resolution(org, actor, meeting_id, data["agenda_item_id"], data["text"], data["outcome"], data.get("motion_id"))})
-        if resource == "minutes" and method == "POST":
+            return send("201 Created", {"id": DB.create_resolution(org, actor, meeting_id, data["agenda_item_id"], data["text"], data["outcome"], data.get("motion_id"), data.get("status", "approved"))})
+        if resource == "resolutions" and method == "GET":
+            if not require("meetings.read"): return send("403 Forbidden", {"error": "forbidden"})
+            return send("200 OK", {"resolutions": DB.resolution_traceability(org)})
+        if resource == "minutes" and method == "POST" and len(parts) == 3:
             if not require("minutes.write"): return send("403 Forbidden", {"error": "forbidden"})
             return send("201 Created", {"id": DB.save_minutes(org, actor, meeting_id, data["agenda_item_id"], data["body"], data.get("status", "draft"))})
         if resource == "actions" and method == "POST" and len(parts) == 3:
             if not require("actions.write"): return send("403 Forbidden", {"error": "forbidden"})
-            return send("201 Created", {"id": DB.create_action(org, actor, meeting_id, data["agenda_item_id"], data["owner_member_id"], data["description"], data.get("due_at"), data.get("resolution_id"))})
+            return send("201 Created", {"id": DB.create_action(org, actor, meeting_id, data["agenda_item_id"], data["owner_member_id"], data["description"], data.get("due_at"), data.get("resolution_id"), data.get("priority", "normal"))})
+        if resource == "actions" and method == "GET":
+            if not require("meetings.read"): return send("403 Forbidden", {"error": "forbidden"})
+            return send("200 OK", {"actions": DB.action_traceability(org)})
+        if resource == "minutes" and len(parts) == 5 and parts[4] == "items" and method == "POST":
+            if not require("minutes.write"): return send("403 Forbidden", {"error": "forbidden"})
+            return send("201 Created", {"id": DB.add_minute_item(org, actor, parts[3], data["item_type"], data["body"], data["position"])})
         if resource == "motions" and len(parts) == 5 and parts[4] == "votes" and method == "POST":
             motion_id, member_id = parts[3], data.get("member_id", actor)
             if not own_or("votes.write", member_id, "votes.manage"): return send("403 Forbidden", {"error": "forbidden"})
@@ -165,6 +174,11 @@ def app(env, start):
             if not action: return send("404 Not Found", {"error": "not found"})
             if not own_or("evidence.write", action["owner_member_id"], "evidence.manage"): return send("403 Forbidden", {"error": "forbidden"})
             return send("201 Created", {"id": DB.add_completion_evidence(org, actor, parts[3], data["note"], data.get("storage_key"))})
+        if resource == "actions" and len(parts) == 5 and parts[4] == "updates" and method == "POST":
+            action = DB.execute("SELECT owner_member_id FROM actions WHERE id=? AND meeting_id=? AND organisation_id=? AND deleted_at IS NULL", (parts[3], meeting_id, org)).fetchone()
+            if not action: return send("404 Not Found", {"error": "not found"})
+            if not own_or("evidence.write", action["owner_member_id"], "actions.write"): return send("403 Forbidden", {"error": "forbidden"})
+            return send("201 Created", {"id": DB.add_action_update(org, actor, parts[3], data["body"], data.get("status"))})
         if resource == "actions" and len(parts) == 5 and parts[4] == "complete" and method == "POST":
             action = DB.execute("SELECT owner_member_id FROM actions WHERE id=? AND meeting_id=? AND organisation_id=? AND deleted_at IS NULL", (parts[3], meeting_id, org)).fetchone()
             if not action: return send("404 Not Found", {"error": "not found"})
