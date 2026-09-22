@@ -83,6 +83,8 @@ class Database:
 
     def create_meeting(self, org, actor, title, starts_at, location, **kw):
         self._require_member(org, actor)
+        if not 1 <= kw.get("quorum_percent", 50) <= 100:
+            raise ValueError("quorum percent must be between 1 and 100")
         meeting_id, created_at = uid(), now()
         self.execute(
             "INSERT INTO meetings(id,organisation_id,title,starts_at,location,status,recurrence_rule,"
@@ -99,7 +101,11 @@ class Database:
     def transition_meeting(self, org, actor, meeting_id, status):
         if status not in {"draft", "scheduled", "published", "completed", "cancelled"}:
             raise ValueError("invalid lifecycle status")
-        self._require_meeting(org, meeting_id)
+        meeting = self._require_meeting(org, meeting_id)
+        transitions = {"draft": {"scheduled", "cancelled"}, "scheduled": {"published", "cancelled"},
+                       "published": {"completed", "cancelled"}, "completed": set(), "cancelled": set()}
+        if status not in transitions[meeting["status"]]:
+            raise ValueError("invalid lifecycle transition")
         self.execute(
             "UPDATE meetings SET status=?,updated_at=? WHERE id=? AND organisation_id=?",
             (status, now(), meeting_id, org),
@@ -194,9 +200,11 @@ class Database:
             "SELECT count(*) n FROM meeting_attendees WHERE meeting_id=? AND organisation_id=? "
             "AND observer=0 AND status='present' AND deleted_at IS NULL", (meeting_id, org),
         ).fetchone()["n"]
+        # A meeting with no eligible attendees cannot be quorate.  Ceiling is
+        # required so (for example) 50% of three members is two, not one.
         required = (eligible * meeting["quorum_percent"] + 99) // 100
         return {"eligible": eligible, "present": present, "required": required,
-                "met": present * 100 >= eligible * meeting["quorum_percent"]}
+                "met": eligible > 0 and present >= required}
 
     def add_document(self, org, actor, title, content, meeting=None, agenda=None, classification="internal"):
         import hashlib
@@ -243,3 +251,142 @@ class Database:
         self.conn.commit()
         self.audit(org, actor, "document.replaced", "document", document_id,
                    {"version": row["n"]})
+
+    def _agenda(self, org, meeting_id, agenda_id):
+        row = self.execute("SELECT 1 FROM agenda_items WHERE id=? AND meeting_id=? "
+                           "AND organisation_id=? AND deleted_at IS NULL",
+                           (agenda_id, meeting_id, org)).fetchone()
+        if not row:
+            raise ValueError("agenda item outside tenant/meeting")
+
+    def declare_conflict(self, org, actor, meeting_id, member_id, interest,
+                         management_action, agenda_id=None):
+        self._require_meeting(org, meeting_id); self._require_member(org, member_id)
+        if agenda_id: self._agenda(org, meeting_id, agenda_id)
+        conflict_id, timestamp = uid(), now()
+        self.execute("INSERT INTO conflict_declarations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     (conflict_id, org, meeting_id, agenda_id, member_id, interest,
+                      management_action, "declared", timestamp, timestamp, None))
+        self.conn.commit()
+        self.audit(org, actor, "conflict.declared", "conflict", conflict_id,
+                   {"meeting_id": meeting_id, "member_id": member_id, "agenda_item_id": agenda_id})
+        return conflict_id
+
+    def create_motion(self, org, actor, meeting_id, agenda_id, proposer_id, text):
+        self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
+        self._require_member(org, proposer_id)
+        attendee = self.execute("SELECT 1 FROM meeting_attendees WHERE meeting_id=? AND member_id=? "
+                                "AND organisation_id=? AND observer=0 AND deleted_at IS NULL",
+                                (meeting_id, proposer_id, org)).fetchone()
+        if not attendee: raise ValueError("proposer is not an eligible attendee")
+        motion_id, timestamp = uid(), now()
+        self.execute("INSERT INTO motions VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (motion_id, org, meeting_id, agenda_id, proposer_id, text, "open",
+                      timestamp, timestamp, None))
+        self.conn.commit(); self.audit(org, actor, "motion.created", "motion", motion_id,
+                                       {"meeting_id": meeting_id, "agenda_item_id": agenda_id})
+        return motion_id
+
+    def cast_vote(self, org, actor, meeting_id, motion_id, member_id, choice):
+        if choice not in {"for", "against", "abstain"}: raise ValueError("invalid vote")
+        motion = self.execute("SELECT * FROM motions WHERE id=? AND meeting_id=? AND organisation_id=? "
+                              "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
+        if not motion: raise ValueError("motion outside tenant/meeting")
+        if motion["status"] != "open": raise ValueError("motion is not open for voting")
+        eligible = self.execute("SELECT 1 FROM meeting_attendees WHERE meeting_id=? AND member_id=? "
+                                "AND organisation_id=? AND status='present' AND observer=0 AND deleted_at IS NULL",
+                                (meeting_id, member_id, org)).fetchone()
+        if not eligible: raise ValueError("only present, non-observer attendees may vote")
+        timestamp = now()
+        self.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?) ON CONFLICT(motion_id,member_id) DO UPDATE SET "
+                     "choice=excluded.choice,cast_at=excluded.cast_at,updated_at=excluded.updated_at",
+                     (uid(), org, motion_id, member_id, choice, timestamp, timestamp))
+        self.conn.commit(); self.audit(org, actor, "vote.cast", "motion", motion_id,
+                                       {"member_id": member_id, "choice": choice})
+
+    def vote_tally(self, org, meeting_id, motion_id):
+        motion = self.execute("SELECT * FROM motions WHERE id=? AND meeting_id=? AND organisation_id=? "
+                              "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
+        if not motion: raise ValueError("motion outside tenant/meeting")
+        counts = {row["choice"]: row["n"] for row in self.execute(
+            "SELECT choice,count(*) n FROM votes WHERE motion_id=? AND organisation_id=? GROUP BY choice",
+            (motion_id, org))}
+        tally = {choice: counts.get(choice, 0) for choice in ("for", "against", "abstain")}
+        quorum = self.quorum(org, meeting_id)
+        tally.update({"eligible": quorum["eligible"], "quorum_met": quorum["met"],
+                      "passed": quorum["met"] and tally["for"] > tally["against"]})
+        return tally
+
+    def close_motion(self, org, actor, meeting_id, motion_id):
+        tally = self.vote_tally(org, meeting_id, motion_id)
+        result = self.execute("UPDATE motions SET status='closed',updated_at=? WHERE id=? AND meeting_id=? "
+                              "AND organisation_id=? AND status='open'", (now(), motion_id, meeting_id, org))
+        if result.rowcount != 1: raise ValueError("motion is not open for voting")
+        self.conn.commit(); self.audit(org, actor, "motion.closed", "motion", motion_id, tally)
+        return tally
+
+    def create_resolution(self, org, actor, meeting_id, agenda_id, text, outcome, motion_id=None):
+        if outcome not in {"carried", "not_carried", "noted"}: raise ValueError("invalid resolution outcome")
+        self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
+        if motion_id:
+            motion = self.execute("SELECT agenda_item_id,status FROM motions WHERE id=? AND meeting_id=? "
+                                  "AND organisation_id=? AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
+            if not motion or motion["agenda_item_id"] != agenda_id or motion["status"] != "closed":
+                raise ValueError("resolution must reference a closed motion on the same agenda item")
+            if (outcome == "carried") != self.vote_tally(org, meeting_id, motion_id)["passed"]:
+                raise ValueError("resolution outcome does not match vote result")
+        resolution_id, timestamp = uid(), now()
+        self.execute("INSERT INTO resolutions VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (resolution_id, org, meeting_id, agenda_id, motion_id, text, outcome,
+                      timestamp, timestamp, None))
+        self.conn.commit(); self.audit(org, actor, "resolution.created", "resolution", resolution_id,
+                                       {"meeting_id": meeting_id, "agenda_item_id": agenda_id, "motion_id": motion_id})
+        return resolution_id
+
+    def save_minutes(self, org, actor, meeting_id, agenda_id, body, status="draft"):
+        if status not in {"draft", "approved"}: raise ValueError("invalid minutes status")
+        self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
+        timestamp = now(); existing = self.execute("SELECT id FROM minutes WHERE meeting_id=? AND agenda_item_id=? "
+                                                   "AND organisation_id=? AND deleted_at IS NULL",
+                                                   (meeting_id, agenda_id, org)).fetchone()
+        if existing:
+            self.execute("UPDATE minutes SET body=?,status=?,updated_at=? WHERE id=? AND organisation_id=?",
+                         (body, status, timestamp, existing["id"], org)); minute_id = existing["id"]; event = "minutes.updated"
+        else:
+            minute_id = uid(); event = "minutes.created"
+            self.execute("INSERT INTO minutes VALUES(?,?,?,?,?,?,?,?,?,?)", (minute_id, org, meeting_id,
+                         agenda_id, body, status, actor, timestamp, timestamp, None))
+        self.conn.commit(); self.audit(org, actor, event, "minutes", minute_id,
+                                       {"meeting_id": meeting_id, "agenda_item_id": agenda_id, "status": status})
+        return minute_id
+
+    def create_action(self, org, actor, meeting_id, agenda_id, owner_id, description, due_at=None, resolution_id=None):
+        self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id); self._require_member(org, owner_id)
+        if resolution_id and not self.execute("SELECT 1 FROM resolutions WHERE id=? AND meeting_id=? AND agenda_item_id=? "
+                                               "AND organisation_id=? AND deleted_at IS NULL", (resolution_id, meeting_id, agenda_id, org)).fetchone():
+            raise ValueError("resolution outside tenant/meeting/agenda")
+        action_id, timestamp = uid(), now()
+        self.execute("INSERT INTO actions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (action_id, org, meeting_id,
+                     agenda_id, resolution_id, owner_id, description, due_at, "open", timestamp, timestamp, None, None))
+        self.conn.commit(); self.audit(org, actor, "action.created", "action", action_id,
+                                       {"owner_member_id": owner_id, "agenda_item_id": agenda_id})
+        return action_id
+
+    def add_completion_evidence(self, org, actor, action_id, note, storage_key=None):
+        action = self.execute("SELECT * FROM actions WHERE id=? AND organisation_id=? AND deleted_at IS NULL", (action_id, org)).fetchone()
+        if not action: raise ValueError("action outside tenant")
+        evidence_id, timestamp = uid(), now()
+        self.execute("INSERT INTO completion_evidence VALUES(?,?,?,?,?,?,?,?)",
+                     (evidence_id, org, action_id, actor, note, storage_key, timestamp, None))
+        self.conn.commit(); self.audit(org, actor, "action.evidence_added", "completion_evidence", evidence_id,
+                                       {"action_id": action_id})
+        return evidence_id
+
+    def complete_action(self, org, actor, action_id):
+        evidence = self.execute("SELECT 1 FROM completion_evidence WHERE action_id=? AND organisation_id=? "
+                                "AND deleted_at IS NULL", (action_id, org)).fetchone()
+        if not evidence: raise ValueError("completion evidence is required")
+        result = self.execute("UPDATE actions SET status='completed',completed_at=?,updated_at=? WHERE id=? "
+                              "AND organisation_id=? AND deleted_at IS NULL AND status='open'", (now(), now(), action_id, org))
+        if result.rowcount != 1: raise ValueError("action is not open")
+        self.conn.commit(); self.audit(org, actor, "action.completed", "action", action_id)
