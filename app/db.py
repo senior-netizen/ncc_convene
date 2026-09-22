@@ -275,12 +275,20 @@ class Database:
     def quorum(self, org, meeting_id):
         meeting = self._require_meeting(org, meeting_id)
         eligible = self.execute(
-            "SELECT count(*) n FROM meeting_attendees WHERE meeting_id=? AND organisation_id=? "
-            "AND observer=0 AND deleted_at IS NULL", (meeting_id, org),
+            "SELECT count(*) n FROM meeting_attendees a WHERE meeting_id=? AND organisation_id=? "
+            "AND observer=0 AND deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND c.agenda_item_id IS NULL AND c.status IN ('recusal_required','recusal_approved') "
+            "AND c.deleted_at IS NULL)", (meeting_id, org, org),
         ).fetchone()["n"]
         present = self.execute(
-            "SELECT count(*) n FROM meeting_attendees WHERE meeting_id=? AND organisation_id=? "
-            "AND observer=0 AND status='present' AND deleted_at IS NULL", (meeting_id, org),
+            "SELECT count(*) n FROM meeting_attendees a WHERE meeting_id=? AND organisation_id=? "
+            "AND observer=0 AND status='present' AND deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND c.agenda_item_id IS NULL AND c.status IN ('recusal_required','recusal_approved') "
+            "AND c.deleted_at IS NULL)", (meeting_id, org, org),
         ).fetchone()["n"]
         # A meeting with no eligible attendees cannot be quorate.  Ceiling is
         # required so (for example) 50% of three members is two, not one.
@@ -354,6 +362,41 @@ class Database:
                    {"meeting_id": meeting_id, "member_id": member_id, "agenda_item_id": agenda_id})
         return conflict_id
 
+    def manage_conflict_recusal(self, org, actor, meeting_id, conflict_id, status):
+        """Record the Chairperson or Secretariat's recusal decision for a conflict."""
+        if status not in {"recusal_required", "recusal_approved"}:
+            raise ValueError("invalid recusal status")
+        self._require_meeting(org, meeting_id)
+        result = self.execute(
+            "UPDATE conflict_declarations SET status=?,management_action=?,updated_at=? "
+            "WHERE id=? AND meeting_id=? AND organisation_id=? AND deleted_at IS NULL",
+            (status, status.replace("_", " "), now(), conflict_id, meeting_id, org),
+        )
+        if result.rowcount != 1:
+            raise ValueError("conflict outside tenant/meeting")
+        self.conn.commit()
+        self.audit(org, actor, "conflict.recusal_managed", "conflict", conflict_id,
+                   {"meeting_id": meeting_id, "status": status})
+
+    def _vote_quorum(self, org, meeting_id, agenda_id):
+        """Return quorum counts for a motion, excluding applicable recusals."""
+        meeting = self._require_meeting(org, meeting_id)
+        where = (
+            " FROM meeting_attendees a WHERE a.meeting_id=? AND a.organisation_id=? "
+            "AND a.observer=0 AND a.deleted_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND (c.agenda_item_id IS NULL OR c.agenda_item_id=?) "
+            "AND c.status IN ('recusal_required','recusal_approved') AND c.deleted_at IS NULL)"
+        )
+        eligible = self.execute("SELECT count(*) n" + where,
+                                (meeting_id, org, org, agenda_id)).fetchone()["n"]
+        present = self.execute("SELECT count(*) n" + where + " AND a.status='present'",
+                               (meeting_id, org, org, agenda_id)).fetchone()["n"]
+        required = (eligible * meeting["quorum_percent"] + 99) // 100
+        return {"eligible": eligible, "present": present, "required": required,
+                "met": eligible > 0 and present >= required}
+
     def create_motion(self, org, actor, meeting_id, agenda_id, proposer_id, text):
         self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
         self._require_member(org, proposer_id)
@@ -375,10 +418,16 @@ class Database:
                               "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
         if not motion: raise ValueError("motion outside tenant/meeting")
         if motion["status"] != "open": raise ValueError("motion is not open for voting")
-        eligible = self.execute("SELECT 1 FROM meeting_attendees WHERE meeting_id=? AND member_id=? "
-                                "AND organisation_id=? AND status='present' AND observer=0 AND deleted_at IS NULL",
-                                (meeting_id, member_id, org)).fetchone()
-        if not eligible: raise ValueError("only present, non-observer attendees may vote")
+        eligible = self.execute(
+            "SELECT 1 FROM meeting_attendees a WHERE a.meeting_id=? AND a.member_id=? "
+            "AND a.organisation_id=? AND a.status='present' AND a.observer=0 AND a.deleted_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=a.meeting_id AND c.member_id=a.member_id "
+            "AND (c.agenda_item_id IS NULL OR c.agenda_item_id=?) "
+            "AND c.status IN ('recusal_required','recusal_approved') AND c.deleted_at IS NULL)",
+            (meeting_id, member_id, org, org, motion["agenda_item_id"]),
+        ).fetchone()
+        if not eligible: raise ValueError("only present, non-recused, non-observer attendees may vote")
         timestamp = now()
         self.execute("INSERT INTO votes VALUES(?,?,?,?,?,?,?) ON CONFLICT(motion_id,member_id) DO UPDATE SET "
                      "choice=excluded.choice,cast_at=excluded.cast_at,updated_at=excluded.updated_at",
@@ -391,10 +440,15 @@ class Database:
                               "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
         if not motion: raise ValueError("motion outside tenant/meeting")
         counts = {row["choice"]: row["n"] for row in self.execute(
-            "SELECT choice,count(*) n FROM votes WHERE motion_id=? AND organisation_id=? GROUP BY choice",
-            (motion_id, org))}
+            "SELECT v.choice,count(*) n FROM votes v WHERE v.motion_id=? AND v.organisation_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM conflict_declarations c WHERE c.organisation_id=? "
+            "AND c.meeting_id=? AND c.member_id=v.member_id "
+            "AND (c.agenda_item_id IS NULL OR c.agenda_item_id=?) "
+            "AND c.status IN ('recusal_required','recusal_approved') AND c.deleted_at IS NULL) "
+            "GROUP BY v.choice",
+            (motion_id, org, org, meeting_id, motion["agenda_item_id"]))}
         tally = {choice: counts.get(choice, 0) for choice in ("for", "against", "abstain")}
-        quorum = self.quorum(org, meeting_id)
+        quorum = self._vote_quorum(org, meeting_id, motion["agenda_item_id"])
         tally.update({"eligible": quorum["eligible"], "quorum_met": quorum["met"],
                       "passed": quorum["met"] and tally["for"] > tally["against"]})
         return tally

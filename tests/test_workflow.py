@@ -12,6 +12,7 @@ class WorkflowTests(unittest.TestCase):
         self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)", (self.org, "One", "workflow", timestamp, timestamp))
         self.secretariat = self.member("secretariat@example.test")
         self.board = self.member("board@example.test")
+        self.unconflicted = self.member("unconflicted@example.test")
         self.db.conn.commit()
 
     def tearDown(self):
@@ -68,6 +69,43 @@ class WorkflowTests(unittest.TestCase):
     def test_zero_eligible_attendees_is_not_quorate(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         self.assertEqual(self.db.quorum(self.org, meeting), {"eligible": 0, "present": 0, "required": 0, "met": False})
+
+    def test_recusals_block_only_affected_members_from_motion_votes(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Conflicted decision", 0)
+        other_agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Other decision", 1)
+        for member in (self.secretariat, self.board, self.unconflicted):
+            self.db.assign_attendee(self.org, self.secretariat, meeting, member)
+            self.db.attendance(self.org, self.secretariat, meeting, member, "present")
+
+        conflict = self.db.declare_conflict(self.org, self.board, meeting, self.board,
+                                            "Supplier interest", "Pending", agenda)
+        self.db.manage_conflict_recusal(self.org, self.secretariat, meeting, conflict,
+                                        "recusal_required")
+        motion = self.db.create_motion(self.org, self.secretariat, meeting, agenda,
+                                       self.secretariat, "Approve supplier")
+        with self.assertRaisesRegex(ValueError, "non-recused"):
+            self.db.cast_vote(self.org, self.board, meeting, motion, self.board, "for")
+        self.db.cast_vote(self.org, self.secretariat, meeting, motion, self.secretariat, "for")
+        self.db.cast_vote(self.org, self.unconflicted, meeting, motion, self.unconflicted, "for")
+        self.assertEqual(self.db.vote_tally(self.org, meeting, motion)["eligible"], 2)
+
+        unaffected_motion = self.db.create_motion(self.org, self.secretariat, meeting,
+                                                  other_agenda, self.board, "Other business")
+        self.db.cast_vote(self.org, self.board, meeting, unaffected_motion, self.board, "for")
+
+        general_conflict = self.db.declare_conflict(self.org, self.board, meeting, self.board,
+                                                    "Meeting-wide interest", "Pending")
+        self.db.manage_conflict_recusal(self.org, self.secretariat, meeting, general_conflict,
+                                        "recusal_approved")
+        with self.assertRaisesRegex(ValueError, "non-recused"):
+            self.db.cast_vote(self.org, self.board, meeting, unaffected_motion, self.board, "against")
+        self.assertEqual(self.db.quorum(self.org, meeting)["eligible"], 2)
+        self.assertEqual(self.db.vote_tally(self.org, meeting, unaffected_motion)["for"], 0)
+        self.assertIsNotNone(self.db.execute(
+            "SELECT 1 FROM audit_logs WHERE resource_id=? AND event_type='conflict.recusal_managed'",
+            (general_conflict,),
+        ).fetchone())
 
 
 if __name__ == "__main__":

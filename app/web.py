@@ -137,6 +137,10 @@ def app(env, start):
                 DB.audit(org, actor, "access.denied", "route", path, {"permission": "rsvp.write"})
                 return send("403 Forbidden", {"error": "forbidden"})
             DB.rsvp(org, actor, meeting_id, member_id, data["response"]); return send("200 OK", {"ok": True})
+        if resource == "conflicts" and len(parts) == 5 and parts[4] == "recusal" and method == "POST":
+            if not require("conflicts.manage"): return send("403 Forbidden", {"error": "forbidden"})
+            DB.manage_conflict_recusal(org, actor, meeting_id, parts[3], data["status"])
+            return send("200 OK", {"ok": True})
         if resource == "conflicts" and method == "POST":
             member_id = data.get("member_id", actor)
             if not own_or("conflicts.write", member_id, "conflicts.manage"): return send("403 Forbidden", {"error": "forbidden"})
