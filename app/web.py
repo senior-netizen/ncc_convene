@@ -2,6 +2,7 @@
 import json
 import os
 from http import cookies
+from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
 from .auth import read_token, token, verify_password
@@ -40,7 +41,7 @@ def app(env, start):
         if not user or not verify_password(data.get("password", ""), user["password_hash"]):
             DB.audit(None, None, "login.denied", "session", payload={"email": data.get("email")})
             return send("401 Unauthorized", {"error": "invalid credentials"})
-        member = DB.execute("SELECT * FROM members WHERE user_id=? AND deleted_at IS NULL", (user["id"],)).fetchone()
+        member = DB.execute("SELECT * FROM members WHERE user_id=? AND status='active' AND deleted_at IS NULL", (user["id"],)).fetchone()
         if not member:
             return send("403 Forbidden", {"error": "no active organisation membership"})
         DB.audit(member["organisation_id"], member["id"], "login", "session")
@@ -52,7 +53,7 @@ def app(env, start):
             DB.audit(session["org"], session["member"], "logout", "session")
         return send("200 OK", {"ok": True}, [("Set-Cookie", "session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/")])
     if not session or not DB.execute(
-        "SELECT 1 FROM members WHERE id=? AND organisation_id=? AND deleted_at IS NULL",
+        "SELECT 1 FROM members WHERE id=? AND organisation_id=? AND status='active' AND deleted_at IS NULL",
         (session.get("member"), session.get("org")),
     ).fetchone():
         return send("401 Unauthorized", {"error": "authentication required"})
@@ -70,6 +71,35 @@ def app(env, start):
         return (member_id == actor and allowed(roles, permission)) or allowed(roles, management_permission)
 
     try:
+        # Organisation identity is deliberately never taken from a request value: all
+        # member operations are bound to the organisation in the signed session.
+        query = parse_qs(env.get("QUERY_STRING", ""), keep_blank_values=True)
+        if path == "/members" and method == "GET":
+            if not require("members.read"): return send("403 Forbidden", {"error": "forbidden"})
+            return send("200 OK", {"members": DB.list_members(org, query.get("search", [None])[0], query.get("status", [None])[0])})
+        if path == "/members" and method == "POST":
+            if not require("members.manage"): return send("403 Forbidden", {"error": "forbidden"})
+            data = body()
+            return send("201 Created", {"id": DB.create_member(org, actor, data["email"], data["display_name"], data.get("title"), data.get("profile"))})
+        member_parts = path.strip("/").split("/")
+        if len(member_parts) >= 2 and member_parts[0] == "members":
+            member_id = member_parts[1]
+            if len(member_parts) == 2 and method == "GET":
+                if not require("members.read"): return send("403 Forbidden", {"error": "forbidden"})
+                member = DB.member_profile(org, member_id)
+                return send("200 OK", {"member": member}) if member else send("404 Not Found", {"error": "not found"})
+            if len(member_parts) == 2 and method in {"PUT", "PATCH"}:
+                if not require("members.manage"): return send("403 Forbidden", {"error": "forbidden"})
+                member = DB.update_member(org, actor, member_id, body())
+                return send("200 OK", {"member": member})
+            if len(member_parts) == 3 and member_parts[2] == "deactivate" and method == "POST":
+                if not require("members.manage"): return send("403 Forbidden", {"error": "forbidden"})
+                DB.deactivate_member(org, actor, member_id); return send("200 OK", {"ok": True})
+            if len(member_parts) == 3 and member_parts[2] == "roles" and method == "POST":
+                if not require("members.manage"): return send("403 Forbidden", {"error": "forbidden"})
+                data = body(); DB.assign_member_role(org, actor, member_id, data["role_id"])
+                return send("200 OK", {"ok": True})
+            return send("404 Not Found", {"error": "not found"})
         if path == "/home" and method == "GET":
             if not require("meetings.read"): return send("403 Forbidden", {"error": "forbidden"})
             meetings = DB.execute("SELECT * FROM meetings WHERE organisation_id=? AND deleted_at IS NULL", (org,))

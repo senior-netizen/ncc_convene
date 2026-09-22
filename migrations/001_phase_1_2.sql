@@ -2,6 +2,10 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS organisations (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, display_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS members (id TEXT PRIMARY KEY, organisation_id TEXT NOT NULL REFERENCES organisations(id), user_id TEXT NOT NULL REFERENCES users(id), title TEXT, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, UNIQUE(organisation_id,user_id));
+-- Keep optional, organisation-scoped contact details separate from the account record.
+-- This preserves a user's identity when they hold memberships in more than one organisation.
+CREATE TABLE IF NOT EXISTS member_profiles (member_id TEXT PRIMARY KEY REFERENCES members(id), organisation_id TEXT NOT NULL REFERENCES organisations(id), phone TEXT, address TEXT, biography TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_member_profiles_tenant ON member_profiles(organisation_id, member_id);
 CREATE TABLE IF NOT EXISTS roles (id TEXT PRIMARY KEY, organisation_id TEXT REFERENCES organisations(id), name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, UNIQUE(organisation_id,name));
 CREATE TABLE IF NOT EXISTS permissions (id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, description TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS member_roles (member_id TEXT NOT NULL REFERENCES members(id), role_id TEXT NOT NULL REFERENCES roles(id), created_at TEXT NOT NULL, PRIMARY KEY(member_id,role_id));
