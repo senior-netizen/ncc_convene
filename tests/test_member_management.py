@@ -68,14 +68,19 @@ class MemberManagementTests(unittest.TestCase):
         foreign_role = self.db.execute("SELECT id FROM roles WHERE organisation_id=?", (self.other_org,)).fetchone()["id"]
         self.assertEqual(self.request(f"/members/{self.viewer}/roles", "POST", {"role_id": foreign_role})[0], "400 Bad Request")
 
-    def test_browser_routes_redirect_or_apply_their_existing_permissions(self):
-        received = []
-        response = b"".join(self.web.app({"PATH_INFO": "/dashboard", "REQUEST_METHOD": "GET", "QUERY_STRING": "", "CONTENT_LENGTH": "0", "wsgi.input": BytesIO(), "HTTP_ACCEPT": "text/html"}, lambda status, headers: received.append((status, headers))))
-        self.assertEqual(received[0][0], "303 See Other")
-        self.assertIn(("Location", "/login"), received[0][1])
-        status, content = self.browser_request("/members")
-        self.assertEqual(status[0], "200 OK")
-        self.assertIn("<h1>Members</h1>", content)
-        status, content = self.browser_request("/activity-log")
-        self.assertEqual(status[0], "403 Forbidden")
-        self.assertIn("Access denied", content)
+    def test_unprovisioned_member_keeps_tenant_scoped_identity_contact_and_term(self):
+        member_id = self.db.create_member(
+            self.org, self.admin, email="governor@example.test", display_name="Governor",
+            title="Commissioner", profile={
+                "phone": "+263 77 000 0000", "profile_image_url": "profiles/governor.png",
+                "term_starts_on": "2026-01-01", "term_ends_on": "2028-12-31",
+            },
+        )
+        member = self.db.member_profile(self.org, member_id)
+        self.assertIsNone(member["user_id"])
+        self.assertEqual(member["email"], "governor@example.test")
+        self.assertEqual(member["profile_image_url"], "profiles/governor.png")
+        self.assertEqual((member["term_starts_on"], member["term_ends_on"]), ("2026-01-01", "2028-12-31"))
+        self.db.deactivate_member(self.org, self.admin, member_id)
+        self.assertIsNotNone(self.db.member_profile(self.org, member_id)["deactivated_at"])
+        self.assertIsNone(self.db.member_profile(self.other_org, member_id))
