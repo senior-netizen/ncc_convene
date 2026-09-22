@@ -8,12 +8,28 @@ Requires Python 3.11+ (no third-party runtime dependencies).
 
 ```bash
 python -m app.seed --database .data/ncc-convene.db
+# Repeatable development reset (preserves immutable audit history):
+python -m app.seed --database .data/ncc-convene.db --reset
 APP_DATABASE=.data/ncc-convene.db APP_SESSION_SECRET='replace-this-with-a-long-random-secret' python -m app.web
 # Open http://127.0.0.1:8000. Demo login: secretariat@ncc.example / ChangeMe123!
 python -m unittest discover -v
 ```
 
 `APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Deploy behind HTTPS and set `APP_COOKIE_SECURE=1`.
+
+## Seeded demo
+
+The seed command creates the NCC operating personas: `superadmin@ncc.example`,
+`orgadmin@ncc.example`, `secretariat@ncc.example`, and `observer@ncc.example`,
+as well as `chair@ncc.example` and `commissioner01@ncc.example` through
+`commissioner16@ncc.example`. Every demo account uses `ChangeMe123!` and must
+be changed before any non-demo deployment. It includes the 17-member board, a
+hybrid 24 September 2026 meeting, eight agenda items, four board papers and
+participant RSVP/attendance data.
+
+`--reset` is allowed in `APP_ENV=development`, `dev`, or `test` (the default is
+development). In another environment application code must call `seed` with an
+existing NCC Super Admin member ID; the command-line reset is therefore refused.
 
 ## API demo path
 
