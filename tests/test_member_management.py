@@ -59,3 +59,20 @@ class MemberManagementTests(unittest.TestCase):
         self.assertEqual(self.request(f"/members/{self.foreign_member}/roles", "POST", {"role_id": self.role})[0], "400 Bad Request")
         foreign_role = self.db.execute("SELECT id FROM roles WHERE organisation_id=?", (self.other_org,)).fetchone()["id"]
         self.assertEqual(self.request(f"/members/{self.viewer}/roles", "POST", {"role_id": foreign_role})[0], "400 Bad Request")
+
+    def test_unprovisioned_member_keeps_tenant_scoped_identity_contact_and_term(self):
+        member_id = self.db.create_member(
+            self.org, self.admin, email="governor@example.test", display_name="Governor",
+            title="Commissioner", profile={
+                "phone": "+263 77 000 0000", "profile_image_url": "profiles/governor.png",
+                "term_starts_on": "2026-01-01", "term_ends_on": "2028-12-31",
+            },
+        )
+        member = self.db.member_profile(self.org, member_id)
+        self.assertIsNone(member["user_id"])
+        self.assertEqual(member["email"], "governor@example.test")
+        self.assertEqual(member["profile_image_url"], "profiles/governor.png")
+        self.assertEqual((member["term_starts_on"], member["term_ends_on"]), ("2026-01-01", "2028-12-31"))
+        self.db.deactivate_member(self.org, self.admin, member_id)
+        self.assertIsNotNone(self.db.member_profile(self.org, member_id)["deactivated_at"])
+        self.assertIsNone(self.db.member_profile(self.other_org, member_id))
