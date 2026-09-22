@@ -1,0 +1,8 @@
+[project]
+name = "ncc-convene"
+version = "0.1.0"
+description = "Tenant-isolated board meeting platform"
+requires-python = ">=3.11"
+
+[tool.unittest]
+start-directory = "tests"
