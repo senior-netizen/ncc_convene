@@ -121,10 +121,10 @@ def seed(db, *, reset=False, actor_member_id=None, development=None):
         db.execute("INSERT INTO members VALUES(?,?,?,?,?,?,?,NULL) ON CONFLICT(organisation_id,user_id) DO UPDATE SET "
                    "id=excluded.id,title=excluded.title,status='active',updated_at=excluded.updated_at,deleted_at=NULL",
                    (member_id, ORGANISATION_ID, user_id, title, "active", SEED_TIME, SEED_TIME))
-        db.execute("INSERT INTO member_profiles VALUES(?,?,?,?,?,?,?) ON CONFLICT(member_id) DO UPDATE SET "
+        db.execute("INSERT INTO member_profiles(member_id,organisation_id,display_name,email,phone,address,biography,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(member_id) DO UPDATE SET "
                    "organisation_id=excluded.organisation_id,phone=excluded.phone,address=excluded.address,"
                    "biography=excluded.biography,updated_at=excluded.updated_at",
-                   (member_id, ORGANISATION_ID, None, None, f"Seeded {role} persona.", SEED_TIME, SEED_TIME))
+                   (member_id, ORGANISATION_ID, name, email, None, None, f"Seeded {role} persona.", SEED_TIME, SEED_TIME))
         db.execute("INSERT INTO member_roles VALUES(?,?,?) ON CONFLICT(member_id,role_id) DO UPDATE SET "
                    "created_at=excluded.created_at", (member_id, role_ids[role], SEED_TIME))
         members[email] = member_id
@@ -163,11 +163,11 @@ def seed(db, *, reset=False, actor_member_id=None, development=None):
                    "status=excluded.status,updated_at=excluded.updated_at,deleted_at=NULL",
                    (document_id, ORGANISATION_ID, MEETING_ID, agenda_ids[position], title, "board", "published",
                     secretary, SEED_TIME, SEED_TIME))
-        db.execute("INSERT INTO document_versions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(document_id,version_number) DO UPDATE SET "
+        db.execute("INSERT INTO document_versions(id,organisation_id,document_id,version_number,storage_key,sha256,size_bytes,created_by,created_at,content_type) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(document_id,version_number) DO UPDATE SET "
                    "id=excluded.id,storage_key=excluded.storage_key,sha256=excluded.sha256,size_bytes=excluded.size_bytes,"
-                   "created_by=excluded.created_by,created_at=excluded.created_at",
+                   "created_by=excluded.created_by,created_at=excluded.created_at,content_type=excluded.content_type",
                    (version_id, ORGANISATION_ID, document_id, 1, f"inline/{version_id}",
-                    hashlib.sha256(content).hexdigest(), len(content), secretary, SEED_TIME))
+                    hashlib.sha256(content).hexdigest(), len(content), secretary, SEED_TIME, "text/plain"))
     participants = board_emails + ("secretariat@ncc.example", "observer@ncc.example")
     responses = ("yes", "yes", "maybe", "yes", "no")
     for index, email in enumerate(participants):

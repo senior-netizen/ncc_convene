@@ -3,6 +3,7 @@ import json
 import os
 from html import escape
 from http import cookies
+from pathlib import Path
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
@@ -12,6 +13,7 @@ from .policy import allowed
 
 DB = Database(os.getenv("APP_DATABASE", ".data/ncc-convene.db"))
 SECRET = os.getenv("APP_SESSION_SECRET", "development-only-secret")
+COOKIE_SECURE = "; Secure" if os.getenv("APP_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"} else ""
 
 
 def wants_html(env):
@@ -19,19 +21,21 @@ def wants_html(env):
     return "text/html" in env.get("HTTP_ACCEPT", "")
 
 
-def page(title, content, session=None):
+def page(title, content, session=None, roles=()):
     """Render the small, dependency-free browser shell used by the staff portal."""
     navigation = ""
     if session:
-        navigation = """
-        <nav aria-label="Primary navigation">
-          <a href="/dashboard">Dashboard</a><a href="/members">Members</a>
-          <a href="/activity-log">Activity log</a><a href="/administration">Administration</a>
+        links = ['<a href="/dashboard">Dashboard</a>']
+        links.append('<a href="/members">Members</a>' if allowed(roles, 'members.read') else '')
+        links.append('<a href="/activity-log">Activity log</a>' if allowed(roles, 'audit.read') else '')
+        links.append('<a href="/administration">Administration</a>' if allowed(roles, 'administration.manage') else '')
+        navigation = f"""
+        <nav aria-label="Primary navigation">{''.join(links)}
           <form action="/logout" method="post"><button type="submit">Log out</button></form>
         </nav>"""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)} · NCC Convene</title>
-    <style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#172033}}nav{{display:flex;gap:1rem;align-items:center;border-bottom:1px solid #d7dce5;padding-bottom:1rem}}nav form{{margin:0}}main{{margin-top:2rem}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;padding:.6rem;border-bottom:1px solid #d7dce5}}.empty{{padding:1rem;background:#f4f6f9;border-radius:.25rem}}label{{display:block;margin:.7rem 0}}input{{display:block;padding:.45rem;width:100%;max-width:26rem}}button{{padding:.45rem .7rem}}</style>
+    <style>body{{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#172033}}nav{{display:flex;gap:1rem;align-items:center;border-bottom:1px solid #d7dce5;padding-bottom:1rem;flex-wrap:wrap}}nav form{{margin:0}}main{{margin-top:2rem}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;padding:.6rem;border-bottom:1px solid #d7dce5}}.empty{{padding:1rem;background:#f4f6f9;border-radius:.25rem}}label{{display:block;margin:.7rem 0}}input,textarea,select{{display:block;padding:.45rem;width:100%;max-width:34rem}}button{{padding:.45rem .7rem}}.workspace-nav{{display:flex;gap:.7rem;flex-wrap:wrap;margin:1rem 0}}.card{{border:1px solid #d7dce5;border-radius:.4rem;padding:1rem;margin:1rem 0}}</style>
     </head><body>{navigation}<main>{content}</main></body></html>"""
 
 
@@ -96,15 +100,15 @@ def app(env, start):
         DB.audit(member["organisation_id"], member["id"], "login", "session")
         value = token({"user": user["id"], "org": member["organisation_id"], "member": member["id"]}, SECRET)
         if browser:
-            return html_send(start, "303 See Other", "", [("Location", "/dashboard"), ("Set-Cookie", f"session={value}; HttpOnly; SameSite=Lax; Path=/")])
-        return send("200 OK", {"ok": True}, [("Set-Cookie", f"session={value}; HttpOnly; SameSite=Lax; Path=/")])
+            return html_send(start, "303 See Other", "", [("Location", "/dashboard"), ("Set-Cookie", f"session={value}; HttpOnly; SameSite=Lax; Path=/{COOKIE_SECURE}")])
+        return send("200 OK", {"ok": True}, [("Set-Cookie", f"session={value}; HttpOnly; SameSite=Lax; Path=/{COOKIE_SECURE}")])
 
     if path == "/logout" and method == "POST":
         if session:
             DB.audit(session["org"], session["member"], "logout", "session")
         if browser:
-            return html_send(start, "303 See Other", "", [("Location", "/login"), ("Set-Cookie", "session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/")])
-        return send("200 OK", {"ok": True}, [("Set-Cookie", "session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/")])
+            return html_send(start, "303 See Other", "", [("Location", "/login"), ("Set-Cookie", f"session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/{COOKIE_SECURE}")])
+        return send("200 OK", {"ok": True}, [("Set-Cookie", f"session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/{COOKIE_SECURE}")])
     if not session or not DB.execute(
         "SELECT 1 FROM members WHERE id=? AND organisation_id=? AND status='active' AND deleted_at IS NULL",
         (session.get("member"), session.get("org")),
@@ -138,15 +142,35 @@ def app(env, start):
             denied = browser_require("meetings.read")
             if denied: return denied
             meetings = [dict(row) for row in DB.execute(
-                "SELECT title,starts_at,location,status FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at",
+                "SELECT id,title,starts_at,location,status FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at",
                 (org,),
             )]
             if meetings:
-                rows = "".join(f"<tr><td>{escape(item['title'])}</td><td>{escape(item['starts_at'])}</td><td>{escape(item['location'])}</td><td>{escape(item['status'])}</td></tr>" for item in meetings)
+                rows = "".join(f"<tr><td><a href=\"/meetings/{item['id']}\">{escape(item['title'])}</a></td><td>{escape(item['starts_at'])}</td><td>{escape(item['location'] or '')}</td><td>{escape(item['status'])}</td></tr>" for item in meetings)
                 content = f"<h1>Dashboard</h1><h2>Meetings</h2><table><thead><tr><th>Meeting</th><th>Starts</th><th>Location</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>"
             else:
                 content = "<h1>Dashboard</h1><div class=\"empty\"><h2>No meetings yet</h2><p>Scheduled meetings will appear here when this module is used.</p></div>"
-            return html_send(start, "200 OK", page("Dashboard", content, session))
+            return html_send(start, "200 OK", page("Dashboard", content, session, roles))
+        if browser and method == "GET" and path.startswith("/meetings/") and len(path.strip('/').split('/')) == 2:
+            denied = browser_require('meetings.read')
+            if denied: return denied
+            meeting_id = path.strip('/').split('/')[1]
+            meeting = DB.meeting(org, meeting_id)
+            if not meeting: return html_send(start, '404 Not Found', page('Not found', '<h1>Meeting not found</h1>', session, roles))
+            agenda = DB.execute('SELECT * FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position', (org, meeting_id))
+            papers = DB.execute('SELECT d.*, v.version_number, v.size_bytes, v.created_at version_created FROM documents d LEFT JOIN document_versions v ON v.document_id=d.id AND v.organisation_id=d.organisation_id WHERE d.organisation_id=? AND d.meeting_id=? AND d.deleted_at IS NULL AND (v.version_number IS NULL OR v.version_number=(SELECT max(v2.version_number) FROM document_versions v2 WHERE v2.document_id=d.id AND v2.organisation_id=?)) ORDER BY d.created_at', (org, meeting_id, org))
+            participants = DB.execute('SELECT a.*, COALESCE(p.display_name,u.display_name) name FROM meeting_attendees a JOIN members m ON m.id=a.member_id LEFT JOIN member_profiles p ON p.member_id=m.id LEFT JOIN users u ON u.id=m.user_id WHERE a.organisation_id=? AND a.meeting_id=? AND a.deleted_at IS NULL ORDER BY name', (org, meeting_id))
+            q = DB.quorum(org, meeting_id)
+            agenda_rows = ''.join(f'<li>{escape(row["title"])} </li>' for row in agenda)
+            paper_rows = ''.join(f'<tr><td>{escape(row["title"])}</td><td>{escape(row["classification"])}</td><td>{row["version_number"] or 0}</td><td>{row["size_bytes"] or 0} bytes</td></tr>' for row in papers)
+            participant_rows = ''.join(f'<tr><td>{escape(row["name"] or "")}</td><td>{"Observer" if row["observer"] else "Member"}</td><td>{escape(row["status"])}</td></tr>' for row in participants)
+            join = ''
+            if meeting['video_metadata'] and allowed(roles, 'meetings.read'):
+                try: join_url = json.loads(meeting['video_metadata']).get('url')
+                except (TypeError, ValueError): join_url = None
+                if join_url: join = f'<p><a href="{escape(join_url)}">Join Meeting</a></p>'
+            content = f'''<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong> (required {q["required"]})</p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol></section><section id="papers"><h2>Board papers ({len(list(DB.execute("SELECT 1 FROM documents WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL", (org, meeting_id))))})</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th></tr>{paper_rows}</table></section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table></section><section id="conflicts"><h2>Conflicts</h2><p>Conflict declarations and recusal decisions are recorded through the secured API workflow.</p></section><section id="motions"><h2>Motions & voting</h2><p>Open motions, vote eligibility and immutable ballots are available through the secured workflow.</p></section><section id="resolutions"><h2>Resolutions</h2><p>Resolution traceability is maintained for this meeting.</p></section><section id="minutes"><h2>Minutes</h2><p>Structured minutes are maintained per agenda item.</p></section><section id="actions"><h2>Actions</h2><p>Open actions: {len([a for a in DB.action_traceability(org) if a["meeting_id"] == meeting_id and a["status"] in ("open", "in_progress")])}</p></section>'''
+            return html_send(start, '200 OK', page('Meeting workspace', content, session, roles))
         if browser and method == "GET" and path == "/members":
             denied = browser_require("members.read")
             if denied: return denied
