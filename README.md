@@ -15,7 +15,7 @@ APP_DATABASE=.data/ncc-convene.db APP_SESSION_SECRET='replace-this-with-a-long-r
 python -m unittest discover -v
 ```
 
-`APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Deploy behind HTTPS and set `APP_COOKIE_SECURE=1`.
+`APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Set `APP_COOKIE_SECURE=1` to add the `Secure` attribute. Uploaded files are stored beneath `.data/uploads/<organisation>/<document>/<version>` (override with `APP_UPLOAD_DIR`). Meetings follow `draft → scheduled → published → completed`; cancellation is available before completion.
 
 ## Seeded demo
 
@@ -30,6 +30,14 @@ participant RSVP/attendance data.
 `--reset` is allowed in `APP_ENV=development`, `dev`, or `test` (the default is
 development). In another environment application code must call `seed` with an
 existing NCC Super Admin member ID; the command-line reset is therefore refused.
+
+## Demo Runbook
+
+1. Start the server and sign in at `/login` as `secretariat@ncc.example`.
+2. Open the seeded Quarterly Commission Meeting from Dashboard.
+3. Review the agenda, papers, participants, attendance and quorum in the meeting workspace.
+4. Use the existing secured API/forms as Secretariat or Chairperson to manage conflicts, motions, resolutions, minutes and actions; use `commissioner01@ncc.example` for member RSVP/voting demonstrations.
+5. Finish on `/activity-log` to show the append-only audit trail.
 
 ## API demo path
 

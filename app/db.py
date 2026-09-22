@@ -1,4 +1,7 @@
+import hashlib
 import json
+import mimetypes
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +31,7 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA.read_text())
         self._migrate_member_profiles()
+        self._migrate_document_metadata()
 
     def _migrate_member_profiles(self):
         """Add profile fields without rebuilding members or losing governance data."""
@@ -44,6 +48,21 @@ class Database:
             if name not in columns:
                 self.conn.execute(f"ALTER TABLE member_profiles ADD COLUMN {name} {definition}")
         self.conn.commit()
+
+    def _migrate_document_metadata(self):
+        columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(document_versions)')}
+        if 'content_type' not in columns:
+            self.conn.execute('ALTER TABLE document_versions ADD COLUMN content_type TEXT NOT NULL DEFAULT \'application/octet-stream\'')
+        self.conn.commit()
+
+    @staticmethod
+    def _safe_upload_path(org, document_id, version_id):
+        root = Path(os.getenv('APP_UPLOAD_DIR', '.data/uploads')).resolve()
+        path = (root / org / document_id / version_id).resolve()
+        if root not in path.parents:
+            raise ValueError('invalid document storage path')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def execute(self, sql, params=()):
         return self.conn.execute(sql, params)
@@ -347,8 +366,9 @@ class Database:
         return {"eligible": eligible, "present": present, "required": required,
                 "met": eligible > 0 and present >= required}
 
-    def add_document(self, org, actor, title, content, meeting=None, agenda=None, classification="internal"):
-        import hashlib
+    def add_document(self, org, actor, title, content, meeting=None, agenda=None, classification="internal", content_type=None):
+        if not isinstance(content, (bytes, bytearray)) or not content:
+            raise ValueError('document content is required')
         if meeting:
             self._require_meeting(org, meeting)
         if agenda and not self.execute(
@@ -358,22 +378,26 @@ class Database:
         ).fetchone():
             raise ValueError("agenda item outside tenant/meeting")
         document_id, version_id, created_at = uid(), uid(), now()
+        storage_path = self._safe_upload_path(org, document_id, version_id)
+        storage_path.write_bytes(bytes(content))
         self.execute(
             "INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (document_id, org, meeting, agenda, title, classification, "draft", actor,
              created_at, created_at, None),
         )
         self.execute(
-            "INSERT INTO document_versions VALUES(?,?,?,?,?,?,?,?,?)",
-            (version_id, org, document_id, 1, "inline/" + version_id,
-             hashlib.sha256(content).hexdigest(), len(content), actor, created_at),
+            "INSERT INTO document_versions(id,organisation_id,document_id,version_number,storage_key,sha256,size_bytes,created_by,created_at,content_type) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (version_id, org, document_id, 1, str(storage_path),
+             hashlib.sha256(content).hexdigest(), len(content), actor, created_at,
+             content_type or 'application/octet-stream'),
         )
         self.conn.commit()
         self.audit(org, actor, "document.uploaded", "document", document_id)
         return document_id
 
-    def replace_document(self, org, actor, document_id, content):
-        import hashlib
+    def replace_document(self, org, actor, document_id, content, content_type=None):
+        if not isinstance(content, (bytes, bytearray)) or not content:
+            raise ValueError('document content is required')
         if not self.execute(
             "SELECT 1 FROM documents WHERE id=? AND organisation_id=? AND deleted_at IS NULL",
             (document_id, org),
@@ -384,10 +408,13 @@ class Database:
             "WHERE document_id=? AND organisation_id=?", (document_id, org),
         ).fetchone()
         version_id = uid()
+        storage_path = self._safe_upload_path(org, document_id, version_id)
+        storage_path.write_bytes(bytes(content))
         self.execute(
-            "INSERT INTO document_versions VALUES(?,?,?,?,?,?,?,?,?)",
-            (version_id, org, document_id, row["n"], "inline/" + version_id,
-             hashlib.sha256(content).hexdigest(), len(content), actor, now()),
+            "INSERT INTO document_versions(id,organisation_id,document_id,version_number,storage_key,sha256,size_bytes,created_by,created_at,content_type) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (version_id, org, document_id, row["n"], str(storage_path),
+             hashlib.sha256(content).hexdigest(), len(content), actor, now(),
+             content_type or 'application/octet-stream'),
         )
         self.conn.commit()
         self.audit(org, actor, "document.replaced", "document", document_id,
@@ -676,6 +703,6 @@ class Database:
                                 "AND deleted_at IS NULL", (action_id, org)).fetchone()
         if not evidence: raise ValueError("completion evidence is required")
         result = self.execute("UPDATE actions SET status='completed',completed_at=?,updated_at=? WHERE id=? "
-                              "AND organisation_id=? AND deleted_at IS NULL AND status='open'", (now(), now(), action_id, org))
-        if result.rowcount != 1: raise ValueError("action is not open")
+                              "AND organisation_id=? AND deleted_at IS NULL AND status IN ('open','in_progress')", (now(), now(), action_id, org))
+        if result.rowcount != 1: raise ValueError("action is not open or in progress")
         self.conn.commit(); self.audit(org, actor, "action.completed", "action", action_id)
