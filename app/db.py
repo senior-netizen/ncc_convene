@@ -310,6 +310,7 @@ class Database:
         self.audit(org, actor, "meeting.lifecycle_changed", "meeting", meeting_id, {"status": status})
 
     def add_agenda(self, org, actor, meeting_id, title, position, parent_id=None, metadata=None):
+        self._require_member(org, actor)
         self._require_meeting(org, meeting_id)
         if parent_id and not self.execute(
             "SELECT 1 FROM agenda_items WHERE id=? AND meeting_id=? AND organisation_id=? "
@@ -327,6 +328,7 @@ class Database:
         return agenda_id
 
     def reorder_agenda(self, org, actor, meeting_id, ordered_ids):
+        self._require_member(org, actor)
         self._require_meeting(org, meeting_id)
         for position, agenda_id in enumerate(ordered_ids):
             if not self.execute(
@@ -342,6 +344,7 @@ class Database:
         self.audit(org, actor, "agenda.reordered", "meeting", meeting_id, {"order": ordered_ids})
 
     def assign_attendee(self, org, actor, meeting_id, member_id, observer=False):
+        self._require_member(org, actor)
         self._require_meeting(org, meeting_id)
         self._require_member(org, member_id)
         self.execute(
@@ -355,6 +358,7 @@ class Database:
                    {"member_id": member_id, "observer": observer})
 
     def rsvp(self, org, actor, meeting_id, member_id, response):
+        self._require_member(org, actor)
         if response not in {"yes", "no", "maybe"}:
             raise ValueError("invalid RSVP")
         self._require_meeting(org, meeting_id)
@@ -371,6 +375,7 @@ class Database:
                    {"member_id": member_id, "response": response})
 
     def attendance(self, org, actor, meeting_id, member_id, status):
+        self._require_member(org, actor)
         if status not in {"present", "absent", "apology"}:
             raise ValueError("invalid attendance")
         self._require_meeting(org, meeting_id)
@@ -411,6 +416,7 @@ class Database:
                 "met": eligible > 0 and present >= required}
 
     def add_document(self, org, actor, title, content, meeting=None, agenda=None, classification="internal", content_type=None):
+        self._require_member(org, actor)
         content = self._validate_upload(content, content_type)
         if meeting:
             self._require_meeting(org, meeting)
@@ -439,6 +445,7 @@ class Database:
         return document_id
 
     def replace_document(self, org, actor, document_id, content, content_type=None):
+        self._require_member(org, actor)
         content = self._validate_upload(content, content_type)
         if not self.execute(
             "SELECT 1 FROM documents WHERE id=? AND organisation_id=? AND deleted_at IS NULL",
@@ -493,6 +500,7 @@ class Database:
 
     def declare_conflict(self, org, actor, meeting_id, member_id, interest,
                          management_action, agenda_id=None):
+        self._require_member(org, actor)
         self._require_meeting(org, meeting_id); self._require_member(org, member_id)
         if agenda_id: self._agenda(org, meeting_id, agenda_id)
         conflict_id, timestamp = uid(), now()
@@ -506,6 +514,7 @@ class Database:
 
     def manage_conflict_recusal(self, org, actor, meeting_id, conflict_id, status):
         """Record the Chairperson or Secretariat's recusal decision for a conflict."""
+        self._require_member(org, actor)
         if status not in {"recusal_required", "recusal_approved"}:
             raise ValueError("invalid recusal status")
         self._require_meeting(org, meeting_id)
@@ -540,6 +549,7 @@ class Database:
                 "met": eligible > 0 and present >= required}
 
     def create_motion(self, org, actor, meeting_id, agenda_id, proposer_id, text):
+        self._require_member(org, actor)
         self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
         self._require_member(org, proposer_id)
         attendee = self.execute("SELECT 1 FROM meeting_attendees WHERE meeting_id=? AND member_id=? "
@@ -644,6 +654,7 @@ class Database:
         return resolution_id
 
     def save_minutes(self, org, actor, meeting_id, agenda_id, body, status="draft"):
+        self._require_member(org, actor)
         if status not in {"draft", "in_review", "approved"}: raise ValueError("invalid minutes status")
         self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
         timestamp = now(); existing = self.execute("SELECT id FROM minutes WHERE meeting_id=? AND agenda_item_id=? "
@@ -660,11 +671,13 @@ class Database:
                                        {"meeting_id": meeting_id, "agenda_item_id": agenda_id, "status": status})
         return minute_id
 
-    def add_minute_item(self, org, actor, minute_id, item_type, body, position):
+    def add_minute_item(self, org, actor, minute_id, item_type, body, position, meeting_id=None):
+        self._require_member(org, actor)
         if item_type not in {"discussion", "decision", "action", "note"}:
             raise ValueError("invalid minute item type")
-        minute = self.execute("SELECT 1 FROM minutes WHERE id=? AND organisation_id=? AND deleted_at IS NULL",
-                              (minute_id, org)).fetchone()
+        minute = self.execute("SELECT 1 FROM minutes WHERE id=? AND organisation_id=? AND deleted_at IS NULL" +
+                              (" AND meeting_id=?" if meeting_id else ""),
+                              (minute_id, org, meeting_id) if meeting_id else (minute_id, org)).fetchone()
         if not minute: raise ValueError("minutes outside tenant")
         if not isinstance(body, str) or not body or not isinstance(position, int) or position < 0:
             raise ValueError("invalid minute item")
@@ -677,6 +690,7 @@ class Database:
 
     def create_action(self, org, actor, meeting_id, agenda_id, owner_id, description, due_at=None,
                       resolution_id=None, priority="normal"):
+        self._require_member(org, actor)
         meeting = self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id); self._require_member(org, owner_id)
         if priority not in {"low", "normal", "high", "critical"}: raise ValueError("invalid action priority")
         if due_at is not None: self._validated_datetime(due_at, "due_at")
@@ -692,6 +706,7 @@ class Database:
         return action_id
 
     def add_action_update(self, org, actor, action_id, body, status=None):
+        self._require_member(org, actor)
         if status is not None and status not in {"open", "in_progress", "completed", "cancelled"}:
             raise ValueError("invalid action status")
         if not isinstance(body, str) or not body: raise ValueError("action update body is required")
@@ -721,19 +736,22 @@ class Database:
                                        {"action_id": action_id, "status": status})
         return update_id
 
-    def action_traceability(self, org, action_id=None):
+    def action_traceability(self, org, action_id=None, meeting_id=None):
         sql = "SELECT * FROM action_traceability WHERE organisation_id=?"
         params = [org]
         if action_id: sql += " AND id=?"; params.append(action_id)
+        if meeting_id: sql += " AND meeting_id=?"; params.append(meeting_id)
         return [dict(row) for row in self.execute(sql + " ORDER BY action_year,action_number", params)]
 
-    def resolution_traceability(self, org, resolution_id=None):
+    def resolution_traceability(self, org, resolution_id=None, meeting_id=None):
         sql = "SELECT * FROM resolution_traceability WHERE organisation_id=?"
         params = [org]
         if resolution_id: sql += " AND id=?"; params.append(resolution_id)
+        if meeting_id: sql += " AND meeting_id=?"; params.append(meeting_id)
         return [dict(row) for row in self.execute(sql + " ORDER BY resolution_year,resolution_number", params)]
 
     def add_completion_evidence(self, org, actor, action_id, note, storage_key=None):
+        self._require_member(org, actor)
         action = self.execute("SELECT * FROM actions WHERE id=? AND organisation_id=? AND deleted_at IS NULL", (action_id, org)).fetchone()
         if not action: raise ValueError("action outside tenant")
         evidence_id, timestamp = uid(), now()

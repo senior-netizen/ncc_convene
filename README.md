@@ -7,13 +7,15 @@ NCC Convene is a tenant-isolated board-meeting application. This repository deli
 Requires Python 3.11+ (no third-party runtime dependencies).
 
 ```bash
-python -m app.seed --database .data/ncc-convene.db
-# Repeatable development reset (preserves immutable audit history):
-python -m app.seed --database .data/ncc-convene.db --reset
-APP_DATABASE=.data/ncc-convene.db APP_SESSION_SECRET='replace-this-with-a-long-random-secret' python -m app.web
+python -m app.demo --data-dir .data/rehearsal --check
+python -m app.demo --data-dir .data/rehearsal
 # Open http://127.0.0.1:8000/login. Demo login: secretariat@ncc.example / ChangeMe123!
 python -m unittest discover -v
 ```
+
+See [DEMO.md](DEMO.md) for the persistent launcher, backup/recovery,
+rehearsal and ten-minute runbook. See [API.md](API.md) for the authenticated
+JSON/file contract and the future Next.js handoff.
 
 `APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Set `APP_COOKIE_SECURE=1` to add the `Secure` attribute. Uploaded files are stored beneath `.data/uploads/<organisation>/<document>/<version>` (override with `APP_UPLOAD_DIR`) and seeded board papers are immediately downloadable. Meetings follow `draft → scheduled → published → completed`; cancellation is available before completion. Browser mutation forms use signed-session CSRF tokens; API JSON workflows remain available for integrations.
 
