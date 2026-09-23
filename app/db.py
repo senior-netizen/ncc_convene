@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA = Path(__file__).parent.parent / "migrations/001_phase_1_2.sql"
+SCHEMAS = tuple(sorted((Path(__file__).parent.parent / "migrations").glob("*.sql")))
 
 
 def now():
@@ -44,7 +44,8 @@ class Database:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(SCHEMA.read_text())
+        for schema in SCHEMAS:
+            self.conn.executescript(schema.read_text())
         self._migrate_member_profiles()
         self._migrate_document_metadata()
 
@@ -165,6 +166,75 @@ class Database:
         ).fetchone()
         if not member:
             raise ValueError("member outside tenant")
+
+    def conference_eligible(self, org, meeting_id, member_id):
+        """Eligibility is assignment or an explicit tenant-scoped operator role."""
+        self._require_meeting(org, meeting_id)
+        member = self.execute("SELECT status FROM members WHERE id=? AND organisation_id=? AND deleted_at IS NULL", (member_id, org)).fetchone()
+        if not member or member["status"] != "active":
+            return False
+        assigned = self.execute("SELECT 1 FROM meeting_attendees WHERE organisation_id=? AND meeting_id=? AND member_id=? AND deleted_at IS NULL", (org, meeting_id, member_id)).fetchone()
+        return bool(assigned or self.roles(member_id, org) & {"Super Admin", "Organisation Admin", "Secretariat"})
+
+    def start_conference(self, org, actor, meeting_id, admission_required=True):
+        self._require_meeting(org, meeting_id)
+        existing = self.execute("SELECT * FROM conference_sessions WHERE organisation_id=? AND meeting_id=? AND state!='ended' ORDER BY created_at DESC LIMIT 1", (org, meeting_id)).fetchone()
+        if existing:
+            return dict(existing)
+        session_id, timestamp = uid(), now()
+        # Provider names contain no meaningful tenant or meeting identifier.
+        room = "ncc-" + uuid.uuid4().hex
+        self.execute("INSERT INTO conference_sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (session_id, org, meeting_id, "livekit", room, "active", int(admission_required), 0, actor, timestamp, timestamp, None, timestamp))
+        self.conn.commit(); self.audit(org, actor, "conference.started", "conference_session", session_id, {"meeting_id": meeting_id})
+        return dict(self.conference(org, meeting_id, session_id))
+
+    def conference(self, org, meeting_id, session_id=None):
+        sql = "SELECT * FROM conference_sessions WHERE organisation_id=? AND meeting_id=?"
+        params = [org, meeting_id]
+        if session_id: sql += " AND id=?"; params.append(session_id)
+        else: sql += " ORDER BY created_at DESC LIMIT 1"
+        return self.execute(sql, params).fetchone()
+
+    def conference_participant(self, org, meeting_id, session_id, member_id):
+        return self.execute("SELECT * FROM conference_participants WHERE organisation_id=? AND meeting_id=? AND conference_session_id=? AND member_id=?", (org, meeting_id, session_id, member_id)).fetchone()
+
+    def request_admission(self, org, actor, meeting_id, session_id):
+        conference = self.conference(org, meeting_id, session_id)
+        if not conference or conference["state"] != "active" or not self.conference_eligible(org, meeting_id, actor): raise ValueError("conference entry is not available")
+        current = self.conference_participant(org, meeting_id, session_id, actor)
+        if current and current["blocked"]: raise ValueError("participant is blocked")
+        if conference["locked"] and not (current and current["admission_state"] == "admitted"):
+            raise ValueError("conference entry is locked")
+        moderator = bool(self.roles(actor, org) & {"Super Admin", "Organisation Admin", "Secretariat", "Chairperson"})
+        state = "admitted" if moderator or not conference["admission_required"] else "waiting"
+        timestamp = now()
+        self.execute("INSERT INTO conference_participants VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(conference_session_id,member_id) DO UPDATE SET admission_state=CASE WHEN blocked=1 OR admission_state='admitted' THEN admission_state ELSE excluded.admission_state END,updated_at=excluded.updated_at", (uid(), org, meeting_id, session_id, actor, state, 0, int(moderator), int(moderator), 0, None, timestamp, timestamp if state == "admitted" else None, None, timestamp))
+        self.conn.commit(); self.audit(org, actor, "conference.admission_requested", "conference_session", session_id, {"state": state})
+        return dict(self.conference_participant(org, meeting_id, session_id, actor))
+
+    def moderate_participant(self, org, actor, meeting_id, session_id, target, action):
+        conference = self.conference(org, meeting_id, session_id)
+        moderator = self.conference_participant(org, meeting_id, session_id, actor)
+        participant = self.conference_participant(org, meeting_id, session_id, target)
+        if not conference or not moderator or not moderator["can_moderate"]: raise PermissionError("conference moderation denied")
+        if not participant: raise ValueError("participant outside conference")
+        timestamp = now()
+        mapping = {"admit": ("admission_state='admitted',admitted_at=?", (timestamp,)), "reject": ("admission_state='rejected'", ()), "remove": ("blocked=1,removed_at=?", (timestamp,)), "grant_present": ("can_present=1", ()), "revoke_present": ("can_present=0", ()), "grant_moderate": ("can_moderate=1", ()), "revoke_moderate": ("can_moderate=0", ())}
+        if action not in mapping: raise ValueError("unsupported moderation action")
+        fields, values = mapping[action]
+        self.execute(f"UPDATE conference_participants SET {fields},updated_at=? WHERE organisation_id=? AND meeting_id=? AND conference_session_id=? AND member_id=?", (*values, timestamp, org, meeting_id, session_id, target))
+        self.conn.commit(); self.audit(org, actor, f"conference.{action}", "conference_participant", participant["id"], {"session_id": session_id, "target_member_id": target})
+        return dict(self.conference_participant(org, meeting_id, session_id, target))
+
+    def set_conference_lock(self, org, actor, meeting_id, session_id, locked):
+        result = self.execute("UPDATE conference_sessions SET locked=?,updated_at=? WHERE id=? AND organisation_id=? AND meeting_id=? AND state='active'", (int(locked), now(), session_id, org, meeting_id))
+        if not result.rowcount: raise ValueError("active conference not found")
+        self.conn.commit(); self.audit(org, actor, "conference.locked" if locked else "conference.unlocked", "conference_session", session_id)
+
+    def end_conference(self, org, actor, meeting_id, session_id):
+        timestamp = now(); result = self.execute("UPDATE conference_sessions SET state='ended',ended_at=?,updated_at=? WHERE id=? AND organisation_id=? AND meeting_id=? AND state!='ended'", (timestamp, timestamp, session_id, org, meeting_id))
+        if not result.rowcount: raise ValueError("active conference not found")
+        self.conn.commit(); self.audit(org, actor, "conference.ended", "conference_session", session_id, {"meeting_id": meeting_id})
 
     def list_members(self, org, search=None, status=None):
         """Return tenant-scoped member identity, contact, and term information."""

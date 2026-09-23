@@ -16,6 +16,8 @@ python -m unittest discover -v
 See [DEMO.md](DEMO.md) for the persistent launcher, backup/recovery,
 rehearsal and ten-minute runbook. See [API.md](API.md) for the authenticated
 JSON/file contract and the future Next.js handoff.
+See [CONFERENCING.md](CONFERENCING.md) for the embedded LiveKit architecture,
+security model, local/Cloud setup, API contract, demo and verification limits.
 
 `APP_SESSION_SECRET` is required outside development. Cookies are `HttpOnly`, `SameSite=Lax`, signed, and expire after eight hours. Set `APP_COOKIE_SECURE=1` to add the `Secure` attribute. Uploaded files are stored beneath `.data/uploads/<organisation>/<document>/<version>` (override with `APP_UPLOAD_DIR`) and seeded board papers are immediately downloadable. Meetings follow `draft → scheduled → published → completed`; cancellation is available before completion. Browser mutation forms use signed-session CSRF tokens; API JSON workflows remain available for integrations.
 

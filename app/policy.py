@@ -7,6 +7,19 @@ ROLE_PERMISSIONS={
                'motions.write','votes.manage','resolutions.write','minutes.write','actions.write','evidence.manage'},
 'Commissioner/Board Member':{'meetings.read','documents.read','rsvp.write','conflicts.write','votes.write','evidence.write'},
 'Observer':{'meetings.read','documents.read'}}
+
+CONFERENCE_CAPABILITIES = {
+    'Super Admin': {'conference.join','conference.moderate','conference.present'},
+    'Organisation Admin': {'conference.join','conference.moderate','conference.present'},
+    'Secretariat': {'conference.join','conference.moderate','conference.present'},
+    'Chairperson': {'conference.join','conference.moderate','conference.present'},
+    'Commissioner/Board Member': {'conference.join'}, 'Observer': {'conference.join'},
+}
+
+def conference_capabilities(roles):
+    result=set()
+    for role in roles: result.update(CONFERENCE_CAPABILITIES.get(role,set()))
+    return result
 def allowed(roles, permission): return any('*' in ROLE_PERMISSIONS.get(r,set()) or permission in ROLE_PERMISSIONS.get(r,set()) for r in roles)
 
 def permissions_for(roles):
