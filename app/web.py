@@ -124,7 +124,7 @@ def app(env, start):
     if path == "/login" and method == "GET" and browser:
         return html_send(start, "200 OK", login_page())
 
-    if path == "/login" and method == "POST":
+    if path in {"/login", "/api/v1/session/login"} and method == "POST":
         try:
             data = browser_body(env) if browser else body()
         except ValueError as exc:
@@ -149,7 +149,7 @@ def app(env, start):
             return html_send(start, "303 See Other", "", [("Location", "/dashboard"), ("Set-Cookie", f"session={value}; HttpOnly; SameSite=Lax; Path=/{COOKIE_SECURE}")])
         return send("200 OK", {"ok": True}, [("Set-Cookie", f"session={value}; HttpOnly; SameSite=Lax; Path=/{COOKIE_SECURE}")])
 
-    if path == "/logout" and method == "POST":
+    if path in {"/logout", "/api/v1/session/logout"} and method == "POST":
         if browser:
             data = browser_body(env)
             if not session or not secrets.compare_digest(str(data.get('csrf', '')), session.get('csrf', '')):
@@ -198,7 +198,9 @@ def app(env, start):
         if not meeting:
             return send("404 Not Found", {"error": {"code": "not_found", "message": "Meeting not found."}})
         q = DB.quorum(org, meeting_id)
-        return send("200 OK", {"meeting": dict(meeting), "quorum": dict(q), "allowed_transitions": allowed_meeting_transitions(meeting["status"])})
+        participants = DB.execute("SELECT count(*) AS total, sum(CASE WHEN status='present' THEN 1 ELSE 0 END) AS present FROM meeting_attendees WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL", (org, meeting_id)).fetchone()
+        agenda = DB.execute("SELECT id,parent_id,title,position,status FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id", (org, meeting_id)).fetchall()
+        return send("200 OK", {"meeting": dict(meeting), "quorum": dict(q), "participants": {"total": participants["total"] or 0, "present": participants["present"] or 0}, "agenda": [dict(item) for item in agenda], "allowed_transitions": allowed_meeting_transitions(meeting["status"])})
 
     def require(permission):
         if allowed(roles, permission):

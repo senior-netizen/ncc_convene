@@ -64,6 +64,22 @@ class WorkflowTests(unittest.TestCase):
         self.db.complete_action(self.org, self.board, action)
         self.assertEqual(self.db.action_traceability(self.org, action)[0]["status"], "completed")
 
+    def test_domain_writes_require_tenant_member_actor(self):
+        meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
+        foreign_org = uid()
+        self.db.execute("INSERT INTO organisations VALUES(?,?,?,?,?,NULL)", (foreign_org, "Two", "workflow-2", now(), now()))
+        foreign_actor = self.member("foreign@example.test")
+        self.db.execute("UPDATE members SET organisation_id=? WHERE id=?", (foreign_org, foreign_actor))
+        self.db.conn.commit()
+        for operation in (
+            lambda: self.db.transition_meeting(self.org, foreign_actor, meeting, "scheduled"),
+            lambda: self.db.close_motion(self.org, foreign_actor, meeting, uid()),
+            lambda: self.db.create_resolution(self.org, foreign_actor, meeting, uid(), "x", "noted"),
+            lambda: self.db.complete_action(self.org, foreign_actor, uid()),
+        ):
+            with self.assertRaisesRegex(ValueError, "member outside tenant"):
+                operation()
+
     def test_vote_and_completion_edge_cases_are_rejected(self):
         meeting = self.db.create_meeting(self.org, self.secretariat, "Meeting", "2026-09-24T09:00Z", "Harare")
         agenda = self.db.add_agenda(self.org, self.secretariat, meeting, "Decision", 0)
