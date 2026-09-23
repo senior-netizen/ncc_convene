@@ -76,12 +76,21 @@ class RsvpAuthorisationTests(unittest.TestCase):
   from io import BytesIO
   from app.auth import token
   payload=b'{"member_id":"'+self.other_member.encode()+b'","response":"yes"}'
-  env={'PATH_INFO':f'/meetings/{self.meeting}/rsvp','REQUEST_METHOD':'POST','CONTENT_LENGTH':str(len(payload)),'wsgi.input':BytesIO(payload),'HTTP_COOKIE':f'session={token({"user":"unused","org":self.org,"member":self.commissioner},self.web.SECRET)}'}
+  env={'PATH_INFO':f'/meetings/{self.meeting}/rsvp','REQUEST_METHOD':'POST','CONTENT_LENGTH':str(len(payload)),'wsgi.input':BytesIO(payload),'HTTP_X_CSRF_TOKEN':'test-csrf','HTTP_COOKIE':f'session={token({"user":"unused","org":self.org,"member":self.commissioner,"csrf":"test-csrf"},self.web.SECRET)}'}
   received=[]
   result=b''.join(self.web.app(env,lambda status,headers: received.append((status,headers))))
   self.assertEqual(received[0][0],'403 Forbidden')
   self.assertEqual(result,b'{"error": "forbidden"}')
   self.assertIsNone(self.database.execute('SELECT 1 FROM meeting_rsvps WHERE member_id=?',(self.other_member,)).fetchone())
+
+ def test_json_meeting_mutation_requires_nonempty_matching_csrf_header(self):
+  from io import BytesIO
+  from app.auth import token
+  payload=b'{"response":"yes"}'
+  env={'PATH_INFO':f'/meetings/{self.meeting}/rsvp','REQUEST_METHOD':'POST','CONTENT_LENGTH':str(len(payload)),'wsgi.input':BytesIO(payload),'HTTP_COOKIE':f'session={token({"user":"unused","org":self.org,"member":self.commissioner,"csrf":"expected"},self.web.SECRET)}'}
+  received=[]; result=b''.join(self.web.app(env,lambda status,headers: received.append(status)))
+  self.assertEqual(received[0],'403 Forbidden')
+  self.assertIn(b'csrf_failed',result)
 
  def test_only_conflict_managers_can_record_recusal_decision(self):
   from io import BytesIO
@@ -91,7 +100,7 @@ class RsvpAuthorisationTests(unittest.TestCase):
   conflict=self.database.declare_conflict(self.org,self.commissioner,self.meeting,self.commissioner,'Interest','Pending',agenda)
   payload=b'{"status":"recusal_required"}'
   def request(member):
-   env={'PATH_INFO':f'/meetings/{self.meeting}/conflicts/{conflict}/recusal','REQUEST_METHOD':'POST','CONTENT_LENGTH':str(len(payload)),'wsgi.input':BytesIO(payload),'HTTP_COOKIE':f'session={token({"user":"unused","org":self.org,"member":member},self.web.SECRET)}'}
+   env={'PATH_INFO':f'/meetings/{self.meeting}/conflicts/{conflict}/recusal','REQUEST_METHOD':'POST','CONTENT_LENGTH':str(len(payload)),'wsgi.input':BytesIO(payload),'HTTP_X_CSRF_TOKEN':'test-csrf','HTTP_COOKIE':f'session={token({"user":"unused","org":self.org,"member":member,"csrf":"test-csrf"},self.web.SECRET)}'}
    received=[]; result=b''.join(self.web.app(env,lambda status,headers: received.append((status,headers))))
    return received[0][0],result
   self.assertEqual(request(self.commissioner),('403 Forbidden',b'{"error": "forbidden"}'))

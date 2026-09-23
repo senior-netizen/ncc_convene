@@ -10,7 +10,11 @@ This contract describes the Python backend that a future Next.js client can use.
 - `GET /api/v1/session/permissions` returns `{"permissions":[…]}`.
 - Unauthenticated JSON requests return HTTP 401. Permission failures return HTTP 403.
 
-The current server-rendered forms carry a per-session CSRF field. Existing JSON mutations rely on `SameSite=Lax`; before enabling a separately hosted browser frontend, add an explicit CSRF header contract to JSON mutations. The recommended integration is **same origin**: proxy `/api/*`, `/documents/*`, and the existing mutation paths from Next.js to Python, preserve `Host`/cookie headers, and keep TLS termination and cookies on one public origin.
+The current server-rendered forms carry a per-session CSRF field. Paper,
+conference, annotation, and legacy `/meetings/*` JSON mutations require the
+per-session value in `X-CSRF-Token`. The integration is **same origin**: proxy
+`/api/*`, `/documents/*`, and `/meetings/*` from Next.js to Python, preserve
+cookie headers, and keep TLS termination and cookies on one public origin.
 
 ## Meeting reads
 
@@ -67,7 +71,10 @@ Important codes include `authentication_required`, `forbidden`, `not_found`, `in
 
 ## Explicit Next.js gaps
 
-Before a public Next.js client ships: add explicit CSRF-token/header enforcement to JSON mutations; add multipart JSON-API aliases for document/evidence upload; normalize every legacy error envelope; define CORS only if same-origin proxying is rejected; and add refresh/session-expiry UX. Business and governance decisions must remain in Python.
+Before a public client ships: add multipart JSON-API aliases for
+document/evidence upload, normalize every legacy error envelope, and define CORS
+only if same-origin proxying is rejected. Business and governance decisions
+must remain in Python.
 
 ## Board papers
 

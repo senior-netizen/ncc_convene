@@ -13,6 +13,48 @@ python -m app.demo --data-dir .data/rehearsal
 python -m unittest discover -v
 ```
 
+For the connected Next.js workspace, keep the Python process running and start
+the frontend in a second shell:
+
+```bash
+cd web
+npm ci
+NCC_API_ORIGIN=http://127.0.0.1:8000 npm run dev
+# Open http://localhost:3000 and sign in; do not open the Python login page.
+```
+
+The Next.js server forwards `/api/*`, `/meetings/*`, and `/documents/*` to
+Python on the same browser origin. Python remains responsible for the signed
+HTTP-only session, tenant selection, CSRF validation, permissions, audit,
+governance decisions, protected files, and LiveKit token issuance. Do not set a
+`NEXT_PUBLIC_` backend secret.
+
+### Ten-minute Next.js demonstration
+
+1. Sign in at `http://localhost:3000` as `secretariat@ncc.example`, open the
+   seeded meeting card, and show the status, agenda, quorum and attendance.
+2. Open **Papers**, create a clearly labelled text-content draft, submit its
+   displayed revision, assign a seeded commissioner, and add a revision comment.
+   Use **Protected documents** separately to demonstrate a real PDF upload and
+   authenticated download.
+3. In a separate private browser session, sign in as the assigned commissioner,
+   review the paper and record a decision. Return as Secretariat to publish all
+   approved papers as a new immutable edition.
+4. Record formal attendance, then create a motion. In the commissioner session,
+   cast a vote; as Secretariat close it and create the linked resolution,
+   minutes, and action. Add an evidence note before completing the action.
+5. On **Conference**, start an admission-required call. Request entry from the
+   commissioner session, admit them, and (only with configured LiveKit) join
+   from both browsers. Move between Agenda and Papers to show the mounted call.
+   Lock, remove, and end are moderator controls; none alters formal attendance
+   or the governance meeting lifecycle.
+
+Real media exchange is not verified by the Python tests. It requires reachable
+LiveKit credentials, browser device permission, and a two-browser rehearsal as
+described in [CONFERENCING.md](CONFERENCING.md). Email delivery, production
+hosting/TLS, persistent backup storage, and LiveKit capacity remain operator
+infrastructure responsibilities.
+
 See [DEMO.md](DEMO.md) for the persistent launcher, backup/recovery,
 rehearsal and ten-minute runbook. See [API.md](API.md) for the authenticated
 JSON/file contract and the future Next.js handoff.
