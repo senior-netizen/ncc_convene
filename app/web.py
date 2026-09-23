@@ -12,7 +12,7 @@ from wsgiref.simple_server import make_server
 
 from .auth import read_token, token, verify_password
 from .db import Database, DuplicateVoteError
-from .policy import allowed
+from .policy import allowed, permissions_for
 
 DB = Database(os.getenv("APP_DATABASE", ".data/ncc-convene.db"))
 SECRET = os.getenv("APP_SESSION_SECRET", "development-only-secret")
@@ -112,6 +112,11 @@ def app(env, start):
         except (json.JSONDecodeError, ValueError):
             raise ValueError("request body must be a JSON object")
 
+    if path == "/api/v1/health" and method == "GET":
+        return send("200 OK", {"status": "ok"})
+    if path == "/api/v1/meta" and method == "GET":
+        return send("200 OK", {"application": "NCC Convene", "api_version": "v1", "engine_version": "0.1.0"})
+
     if path == "/login" and method == "GET" and browser:
         return html_send(start, "200 OK", login_page())
 
@@ -160,6 +165,30 @@ def app(env, start):
 
     org, actor = session["org"], session["member"]
     roles = DB.roles(actor, org)
+
+    if path == "/api/v1/session/me" and method == "GET":
+        member = DB.execute("SELECT m.id,m.title,m.status,COALESCE(p.display_name,u.display_name) AS display_name,o.id AS organisation_id,o.name AS organisation_name FROM members m JOIN users u ON u.id=m.user_id JOIN organisations o ON o.id=m.organisation_id LEFT JOIN member_profiles p ON p.member_id=m.id AND p.organisation_id=m.organisation_id WHERE m.id=? AND m.organisation_id=? AND m.deleted_at IS NULL", (actor, org)).fetchone()
+        return send("200 OK", {"member": dict(member), "roles": sorted(roles), "permissions": sorted(permissions_for(roles))})
+    if path == "/api/v1/session/permissions" and method == "GET":
+        return send("200 OK", {"permissions": sorted(roles)})
+    if path == "/api/v1/meetings" and method == "GET":
+        if not allowed(roles, "meetings.read"):
+            return send("403 Forbidden", {"error": {"code": "forbidden", "message": "Permission denied."}})
+        meetings = [dict(row) for row in DB.execute("SELECT id,title,starts_at,ends_at,location,status,video_provider FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at", (org,))]
+        return send("200 OK", {"items": meetings})
+    if path.startswith("/api/v1/meetings/") and path.endswith("/agenda") and method == "GET":
+        meeting_id = path.rstrip("/").split("/")[-2]
+        if not DB.meeting(org, meeting_id):
+            return send("404 Not Found", {"error": {"code": "not_found", "message": "Meeting not found."}})
+        agenda = [dict(row) for row in DB.execute("SELECT id,parent_id,title,description,position,status FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id", (org, meeting_id))]
+        return send("200 OK", {"items": agenda})
+    if path.startswith("/api/v1/meetings/") and method == "GET":
+        meeting_id = path.rstrip("/").split("/")[-1]
+        meeting = DB.meeting(org, meeting_id)
+        if not meeting:
+            return send("404 Not Found", {"error": {"code": "not_found", "message": "Meeting not found."}})
+        q = DB.quorum(org, meeting_id)
+        return send("200 OK", {"meeting": dict(meeting), "quorum": dict(q), "allowed_transitions": {"draft": ["scheduled", "cancelled"], "scheduled": ["published", "cancelled"], "published": ["completed", "cancelled"], "completed": [], "cancelled": []}.get(meeting["status"], [])})
 
     def require(permission):
         if allowed(roles, permission):

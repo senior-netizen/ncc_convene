@@ -8,3 +8,9 @@ ROLE_PERMISSIONS={
 'Commissioner/Board Member':{'meetings.read','documents.read','rsvp.write','conflicts.write','votes.write','evidence.write'},
 'Observer':{'meetings.read','documents.read'}}
 def allowed(roles, permission): return any('*' in ROLE_PERMISSIONS.get(r,set()) or permission in ROLE_PERMISSIONS.get(r,set()) for r in roles)
+
+def permissions_for(roles):
+    permissions = set()
+    for role in roles:
+        permissions.update(ROLE_PERMISSIONS.get(role, set()))
+    return permissions
