@@ -279,6 +279,7 @@ class Database:
         return meeting_id
 
     def transition_meeting(self, org, actor, meeting_id, status):
+        self._require_member(org, actor)
         if status not in {"draft", "scheduled", "published", "completed", "cancelled"}:
             raise ValueError("invalid lifecycle status")
         meeting = self._require_meeting(org, meeting_id)
@@ -537,6 +538,7 @@ class Database:
         return motion_id
 
     def cast_vote(self, org, actor, meeting_id, motion_id, member_id, choice):
+        self._require_member(org, actor)
         if choice not in {"for", "against", "abstain"}: raise ValueError("invalid vote")
         motion = self.execute("SELECT * FROM motions WHERE id=? AND meeting_id=? AND organisation_id=? "
                               "AND deleted_at IS NULL", (motion_id, meeting_id, org)).fetchone()
@@ -582,6 +584,7 @@ class Database:
         return tally
 
     def close_motion(self, org, actor, meeting_id, motion_id):
+        self._require_member(org, actor)
         tally = self.vote_tally(org, meeting_id, motion_id)
         result = self.execute("UPDATE motions SET status='closed',updated_at=? WHERE id=? AND meeting_id=? "
                               "AND organisation_id=? AND status='open'", (now(), motion_id, meeting_id, org))
@@ -591,6 +594,7 @@ class Database:
 
     def create_resolution(self, org, actor, meeting_id, agenda_id, text, outcome, motion_id=None,
                           status="approved"):
+        self._require_member(org, actor)
         if outcome not in {"carried", "not_carried", "noted"}: raise ValueError("invalid resolution outcome")
         if status not in {"draft", "approved", "published"}: raise ValueError("invalid resolution status")
         meeting = self._require_meeting(org, meeting_id); self._agenda(org, meeting_id, agenda_id)
@@ -723,6 +727,7 @@ class Database:
         return evidence_id
 
     def complete_action(self, org, actor, action_id):
+        self._require_member(org, actor)
         evidence = self.execute("SELECT 1 FROM completion_evidence WHERE action_id=? AND organisation_id=? "
                                 "AND deleted_at IS NULL", (action_id, org)).fetchone()
         if not evidence: raise ValueError("completion evidence is required")
