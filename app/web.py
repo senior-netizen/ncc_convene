@@ -351,7 +351,16 @@ def app(env, start):
         return owner_allowed or allowed(roles, 'actions.write')
 
     def api_csrf():
-        return secrets.compare_digest(env.get("HTTP_X_CSRF_TOKEN", ""), session.get("csrf", ""))
+        expected = session.get("csrf")
+        supplied = env.get("HTTP_X_CSRF_TOKEN")
+        return bool(expected and supplied and secrets.compare_digest(supplied, expected))
+
+    # Same-origin is not, by itself, a mutation defence. The Next.js client
+    # obtains this value from the authenticated session response and every
+    # legacy JSON meeting mutation must prove possession of it. Browser HTML
+    # forms continue to use their existing signed-session form field below.
+    if not browser and method in {"POST", "PUT", "PATCH", "DELETE"} and path.startswith("/meetings") and not api_csrf():
+        return error("403 Forbidden", "csrf_failed", "CSRF validation failed.")
 
     try:
         # Organisation identity is deliberately never taken from a request value: all
