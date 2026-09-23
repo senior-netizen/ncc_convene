@@ -68,3 +68,16 @@ Important codes include `authentication_required`, `forbidden`, `not_found`, `in
 ## Explicit Next.js gaps
 
 Before a public Next.js client ships: add explicit CSRF-token/header enforcement to JSON mutations; add multipart JSON-API aliases for document/evidence upload; normalize every legacy error envelope; define CORS only if same-origin proxying is rejected; and add refresh/session-expiry UX. Business and governance decisions must remain in Python.
+
+## Board papers
+
+All routes derive organisation and member identity from the signed session cookie. Mutation requests require the session's `X-CSRF-Token` value.
+
+- `GET /api/v1/papers?meeting_id=...` lists accessible tenant papers.
+- `POST /api/v1/papers` creates a template-backed draft and initial revision.
+- `GET /api/v1/papers/{id}` returns its reviews and revision-bound comments.
+- `POST /api/v1/papers/{id}/submit` uses `revision_id` and `lock_version` as a compare-and-swap guard.
+- `POST /api/v1/papers/{id}/revision` creates, rather than replaces, a revision.
+- `POST /api/v1/papers/{id}/reviewers`, `/decision`, and `/comments` operate on an exact revision.
+- `POST /api/v1/board-packs/publish` creates a new immutable edition snapshot.
+- `GET|POST /api/v1/annotations` reads only the current member's annotations and creates a private, revision-anchored annotation.

@@ -13,7 +13,7 @@ from email.parser import BytesParser
 from wsgiref.simple_server import make_server
 
 from .auth import read_token, token, verify_password
-from .db import Database, DuplicateVoteError, allowed_meeting_transitions
+from .db import Database, DuplicateVoteError, StaleRevisionError, allowed_meeting_transitions
 from .policy import allowed, permissions_for
 from .policy import conference_capabilities
 from .conference import provider, ConferenceConfigurationError
@@ -350,10 +350,64 @@ def app(env, start):
         owner_allowed = action['owner_member_id'] == actor and (allowed(roles, permission) or allowed(roles, 'evidence.write'))
         return owner_allowed or allowed(roles, 'actions.write')
 
+    def api_csrf():
+        return secrets.compare_digest(env.get("HTTP_X_CSRF_TOKEN", ""), session.get("csrf", ""))
+
     try:
         # Organisation identity is deliberately never taken from a request value: all
         # member operations are bound to the organisation in the signed session.
         query = parse_qs(env.get("QUERY_STRING", ""), keep_blank_values=True)
+        paper_parts = path.strip("/").split("/")
+        if paper_parts[:3] == ["api", "v1", "papers"]:
+            if not allowed(roles, "documents.read"):
+                return error("403 Forbidden", "forbidden", "Paper access denied.")
+            if len(paper_parts) == 3 and method == "GET":
+                meeting_id = query.get("meeting_id", [None])[0]
+                mine = query.get("assigned_to_me", ["0"])[0] == "1"
+                return send("200 OK", {"items": DB.list_board_papers(org, meeting_id, actor if mine else None, mine)})
+            if len(paper_parts) == 3 and method == "POST":
+                if not allowed(roles, "papers.submit"): return error("403 Forbidden", "forbidden", "Paper submission denied.")
+                if not api_csrf(): return error("403 Forbidden", "csrf_failed", "CSRF validation failed.")
+                data = body(); paper_id = DB.create_board_paper(org, actor, data["meeting_id"], data["agenda_item_id"], data, data.get("content", "").encode(), data.get("classification", "confidential"), data.get("content_type", "application/pdf"))
+                return send("201 Created", {"id": paper_id, "paper": DB.board_paper(org, paper_id)})
+            if len(paper_parts) < 4: return error("404 Not Found", "not_found", "Paper endpoint not found.")
+            paper_id = paper_parts[3]; paper = DB.board_paper(org, paper_id)
+            if not paper: return error("404 Not Found", "not_found", "Paper not found.")
+            if len(paper_parts) == 4 and method == "GET":
+                comments = [dict(row) for row in DB.execute("SELECT id,revision_id,author_member_id,body,created_at FROM paper_review_comments WHERE organisation_id=? AND paper_id=? AND deleted_at IS NULL ORDER BY created_at,id", (org, paper_id))]
+                reviews = [dict(row) for row in DB.execute("SELECT id,revision_id,reviewer_member_id,deadline,status,assigned_by,assigned_at,decided_at,reason FROM paper_review_assignments WHERE organisation_id=? AND paper_id=? ORDER BY assigned_at,id", (org, paper_id))]
+                return send("200 OK", {"paper": paper, "comments": comments, "reviews": reviews})
+            if method != "POST": return error("405 Method Not Allowed", "method_not_allowed", "Method not allowed.")
+            if not api_csrf(): return error("403 Forbidden", "csrf_failed", "CSRF validation failed.")
+            data = body(); suffix = paper_parts[4:]
+            if suffix == ["submit"]:
+                if not allowed(roles, "papers.submit"): return error("403 Forbidden", "forbidden", "Paper submission denied.")
+                return send("200 OK", {"paper": DB.transition_board_paper(org, actor, paper_id, "submit", data["revision_id"], int(data["lock_version"]), data.get("reason"))})
+            if suffix == ["revision"]:
+                return send("201 Created", {"paper": DB.revise_board_paper(org, actor, paper_id, data, data.get("content", "").encode(), data["revision_id"], data.get("content_type", "application/pdf"))})
+            if suffix == ["reviewers"]:
+                if not allowed(roles, "papers.review"): return error("403 Forbidden", "forbidden", "Review assignment denied.")
+                assignment_id = DB.assign_paper_reviewer(org, actor, paper_id, data["reviewer_member_id"], data.get("deadline"))
+                return send("201 Created", {"id": assignment_id, "paper": DB.board_paper(org, paper_id)})
+            if suffix == ["decision"]:
+                if not allowed(roles, "papers.review"): return error("403 Forbidden", "forbidden", "Review decision denied.")
+                return send("200 OK", {"paper": DB.review_board_paper(org, actor, paper_id, data["decision"], data["revision_id"], data["reason"])})
+            if suffix == ["comments"]:
+                return send("201 Created", {"id": DB.add_paper_comment(org, actor, paper_id, data["revision_id"], data["body"])})
+            return error("404 Not Found", "not_found", "Paper endpoint not found.")
+        if paper_parts[:4] == ["api", "v1", "board-packs", "publish"] and method == "POST":
+            if not allowed(roles, "papers.publish"): return error("403 Forbidden", "forbidden", "Publication denied.")
+            if not api_csrf(): return error("403 Forbidden", "csrf_failed", "CSRF validation failed.")
+            data = body(); return send("201 Created", {"id": DB.publish_board_pack(org, actor, data["meeting_id"], data["paper_ids"], data.get("label"))})
+        if paper_parts[:3] == ["api", "v1", "annotations"]:
+            if not allowed(roles, "annotations.write"): return error("403 Forbidden", "forbidden", "Annotation access denied.")
+            if len(paper_parts) == 3 and method == "GET":
+                revision_id = query.get("revision_id", [None])[0]
+                items = [dict(row) for row in DB.execute("SELECT id,document_id,revision_id,kind,locator,body,shared,created_at,updated_at FROM document_annotations WHERE organisation_id=? AND member_id=? AND revision_id=? AND deleted_at IS NULL ORDER BY created_at,id", (org, actor, revision_id))]
+                return send("200 OK", {"items": items})
+            if len(paper_parts) == 3 and method == "POST":
+                if not api_csrf(): return error("403 Forbidden", "csrf_failed", "CSRF validation failed.")
+                data = body(); return send("201 Created", {"id": DB.add_annotation(org, actor, data["document_id"], data["revision_id"], data["kind"], data["locator"], data.get("body"))})
         if browser and method == "GET" and path in {"/", "/dashboard"}:
             denied = browser_require("meetings.read")
             if denied: return denied
@@ -744,6 +798,10 @@ def app(env, start):
             if not own_or("evidence.write", action["owner_member_id"], "actions.write"): return send("403 Forbidden", {"error": "forbidden"})
             DB.complete_action(org, actor, parts[3]); return send("200 OK", {"ok": True})
         return send("404 Not Found", {"error": "not found"})
+    except StaleRevisionError as exc:
+        return error("409 Conflict", "stale_revision", str(exc))
+    except PermissionError as exc:
+        return error("403 Forbidden", "forbidden", str(exc))
     except DuplicateVoteError as exc:
         if browser:
             return html_send(start, "409 Conflict", page("Vote not accepted", f"<h1>Vote not accepted</h1><p>{escape(str(exc))}</p>", session, roles))
