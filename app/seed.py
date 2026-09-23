@@ -195,5 +195,6 @@ if __name__ == "__main__":
     parser.add_argument("--reset", action="store_true", help="reset mutable demo records (development only)")
     args = parser.parse_args()
     os.makedirs(os.path.dirname(args.database) or ".", exist_ok=True)
-    seed(Database(args.database), reset=args.reset)
+    with Database(args.database) as database:
+        seed(database, reset=args.reset)
     print("Seeded National Competitiveness Commission")
