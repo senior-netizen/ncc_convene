@@ -3,6 +3,7 @@ name = "ncc-convene"
 version = "0.1.0"
 description = "Tenant-isolated board meeting platform"
 requires-python = ">=3.11"
+dependencies = ["livekit-api==1.0.7"]
 
 [tool.unittest]
 start-directory = "tests"

@@ -84,7 +84,8 @@ def _clear_demo_content(db):
     """Clear mutable demo records, leaving the append-only audit trail intact."""
     # Delete children before their parents.  audit_logs is intentionally absent:
     # its immutability is a system invariant, including during a demo reset.
-    for table in ("completion_evidence", "actions", "minutes", "resolutions", "votes",
+    for table in ("conference_messages", "conference_connections", "conference_participants",
+                  "conference_sessions", "completion_evidence", "actions", "minutes", "resolutions", "votes",
                   "motions", "conflict_declarations", "document_notes", "document_versions",
                   "documents", "meeting_rsvps", "meeting_attendees", "agenda_items", "meetings",
                   "committee_members", "committees"):

@@ -2,6 +2,7 @@
 import json
 import secrets
 import os
+import asyncio
 from html import escape
 from http import cookies
 from pathlib import Path
@@ -14,6 +15,8 @@ from wsgiref.simple_server import make_server
 from .auth import read_token, token, verify_password
 from .db import Database, DuplicateVoteError, allowed_meeting_transitions
 from .policy import allowed, permissions_for
+from .policy import conference_capabilities
+from .conference import provider, ConferenceConfigurationError
 
 DB = Database(os.getenv("APP_DATABASE", ".data/ncc-convene.db"))
 SECRET = os.getenv("APP_SESSION_SECRET")
@@ -192,7 +195,7 @@ def app(env, start):
 
     if path == "/api/v1/session/me" and method == "GET":
         member = DB.execute("SELECT m.id,m.title,m.status,COALESCE(p.display_name,u.display_name) AS display_name,o.id AS organisation_id,o.name AS organisation_name FROM members m JOIN users u ON u.id=m.user_id JOIN organisations o ON o.id=m.organisation_id LEFT JOIN member_profiles p ON p.member_id=m.id AND p.organisation_id=m.organisation_id WHERE m.id=? AND m.organisation_id=? AND m.deleted_at IS NULL", (actor, org)).fetchone()
-        return send("200 OK", {"member": dict(member), "roles": sorted(roles), "permissions": sorted(permissions_for(roles))})
+        return send("200 OK", {"member": dict(member), "roles": sorted(roles), "permissions": sorted(permissions_for(roles)), "csrf": session["csrf"]})
     if path == "/api/v1/session/permissions" and method == "GET":
         return send("200 OK", {"permissions": sorted(permissions_for(roles))})
     if path == "/api/v1/meetings" and method == "GET":
@@ -264,6 +267,62 @@ def app(env, start):
         return send("200 OK", {"meeting": public_meeting, "agenda": agenda, "participants": participants,
             "quorum": DB.quorum(org, meeting_id), "documents": documents, "conflicts": conflicts,
             "motions": motions, "resolutions": resolutions, "minutes": minutes, "actions": actions})
+
+    # Conference routes intentionally derive organisation, identity and grants
+    # from the signed application session. No browser-supplied room or role is used.
+    if len(api_parts) >= 5 and api_parts[:3] == ["api", "v1", "meetings"] and api_parts[4] == "conference":
+        meeting_id = api_parts[3]
+        if not DB.meeting(org, meeting_id): return error("404 Not Found", "not_found", "Meeting not found.")
+        caps = conference_capabilities(roles)
+        if "conference.join" not in caps: return error("403 Forbidden", "forbidden", "Conference access denied.")
+        def conference_body():
+            if method not in {"POST", "PATCH", "DELETE"}: return {}
+            if not secrets.compare_digest(env.get("HTTP_X_CSRF_TOKEN", ""), session.get("csrf", "")):
+                raise PermissionError("CSRF validation failed")
+            return body()
+        try:
+            suffix = api_parts[5:]
+            if not suffix and method == "GET":
+                row = DB.conference(org, meeting_id)
+                participant = DB.conference_participant(org, meeting_id, row["id"], actor) if row else None
+                queue = []
+                if row and "conference.moderate" in caps:
+                    queue = [dict(x) for x in DB.execute("SELECT member_id,admission_state,blocked,can_moderate,can_present,hand_raised_at,requested_at FROM conference_participants WHERE organisation_id=? AND meeting_id=? AND conference_session_id=? ORDER BY requested_at", (org, meeting_id, row["id"]))]
+                return send("200 OK", {"conference": dict(row) if row else None, "participant": dict(participant) if participant else None, "capabilities": sorted(caps), "participants": queue, "provider_configured": provider.configured})
+            data = conference_body()
+            if suffix == ["start"] and method == "POST":
+                if "conference.moderate" not in caps: return error("403 Forbidden", "forbidden", "Moderation denied.")
+                return send("201 Created", {"conference": DB.start_conference(org, actor, meeting_id, data.get("admission_required", True))})
+            row = DB.conference(org, meeting_id, data.get("session_id"))
+            if not row: return error("404 Not Found", "not_found", "Conference not found.")
+            session_id = row["id"]
+            if suffix == ["admission"] and method == "POST":
+                return send("200 OK", {"participant": DB.request_admission(org, actor, meeting_id, session_id)})
+            if suffix == ["token"] and method == "POST":
+                p = DB.conference_participant(org, meeting_id, session_id, actor)
+                if row["state"] != "active" or not p or p["admission_state"] != "admitted" or p["blocked"]:
+                    return error("403 Forbidden", "not_admitted", "Participant is not admitted.")
+                identity = f"{session_id}:{actor}"
+                member = DB.member_profile(org, actor)
+                jwt = provider.participant_token(row["provider_room"], identity, member["display_name"], can_publish=True, metadata=json.dumps({"member_id": actor, "can_present": bool(p["can_present"]), "can_moderate": bool(p["can_moderate"])}))
+                return send("200 OK", {"token": jwt, "url": provider.url, "expires_in": 300, "identity": identity}, [("Cache-Control", "no-store, private"), ("Pragma", "no-cache")])
+            if suffix == ["lock"] and method == "POST":
+                if "conference.moderate" not in caps: return error("403 Forbidden", "forbidden", "Moderation denied.")
+                DB.set_conference_lock(org, actor, meeting_id, session_id, bool(data["locked"])); return send("200 OK", {"ok": True})
+            if suffix == ["moderate"] and method == "POST":
+                updated = DB.moderate_participant(org, actor, meeting_id, session_id, data["member_id"], data["action"])
+                if data["action"] == "remove" and provider.configured:
+                    asyncio.run(provider.remove(row["provider_room"], f"{session_id}:{data['member_id']}"))
+                return send("200 OK", {"participant": updated})
+            if suffix == ["end"] and method == "POST":
+                if "conference.moderate" not in caps: return error("403 Forbidden", "forbidden", "Moderation denied.")
+                if provider.configured: asyncio.run(provider.delete_room(row["provider_room"]))
+                DB.end_conference(org, actor, meeting_id, session_id); return send("200 OK", {"ok": True})
+            return error("404 Not Found", "not_found", "Conference endpoint not found.")
+        except PermissionError as exc:
+            return error("403 Forbidden", "forbidden", str(exc))
+        except ConferenceConfigurationError as exc:
+            return error("503 Service Unavailable", "provider_unavailable", str(exc))
 
     def require(permission):
         if allowed(roles, permission):
