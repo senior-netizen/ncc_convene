@@ -48,6 +48,23 @@ class Database:
         self._migrate_member_profiles()
         self._migrate_document_metadata()
 
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except (AttributeError, sqlite3.Error):
+            pass
+
     def _migrate_member_profiles(self):
         """Add profile fields without rebuilding members or losing governance data."""
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(member_profiles)")}
