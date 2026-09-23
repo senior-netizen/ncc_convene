@@ -26,6 +26,8 @@ class Database:
     """Tenant-scoped persistence operations for the NCC Convene application."""
 
     def __init__(self, path=":memory:"):
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
