@@ -22,6 +22,10 @@ class DuplicateVoteError(ValueError):
     """Raised when a member attempts to cast more than one vote on a motion."""
 
 
+class StaleRevisionError(ValueError):
+    """Raised when a workflow mutation targets a superseded paper revision."""
+
+
 MEETING_TRANSITIONS = {
     "draft": ("scheduled", "cancelled"),
     "scheduled": ("published", "cancelled"),
@@ -350,14 +354,17 @@ class Database:
     def create_meeting(self, org, actor, title, starts_at, location, **kw):
         self._require_member(org, actor)
         self._validated_datetime(starts_at, "starts_at")
+        committee_id = kw.get("committee_id")
+        if committee_id and not self.execute("SELECT 1 FROM committees WHERE id=? AND organisation_id=? AND deleted_at IS NULL", (committee_id, org)).fetchone():
+            raise ValueError("committee outside tenant")
         if not 1 <= kw.get("quorum_percent", 50) <= 100:
             raise ValueError("quorum percent must be between 1 and 100")
         meeting_id, created_at = uid(), now()
         self.execute(
-            "INSERT INTO meetings(id,organisation_id,title,starts_at,location,status,recurrence_rule,"
+            "INSERT INTO meetings(id,organisation_id,committee_id,title,starts_at,location,status,recurrence_rule,"
             "quorum_percent,video_provider,video_metadata,created_by,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (meeting_id, org, title, starts_at, location, "draft", kw.get("recurrence_rule"),
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (meeting_id, org, committee_id, title, starts_at, location, "draft", kw.get("recurrence_rule"),
              kw.get("quorum_percent", 50), kw.get("video_provider"),
              json.dumps(kw.get("video_metadata", {})), actor, created_at, created_at),
         )
@@ -538,6 +545,195 @@ class Database:
         self.conn.commit()
         self.audit(org, actor, "document.replaced", "document", document_id,
                    {"version": row["n"]})
+
+    def create_board_paper(self, org, actor, meeting_id, agenda_id, fields, content,
+                           classification="confidential", content_type="application/pdf"):
+        """Create a draft paper using the existing immutable document store."""
+        self._require_member(org, actor)
+        meeting = self._require_meeting(org, meeting_id)
+        self._agenda(org, meeting_id, agenda_id)
+        if not meeting["committee_id"]:
+            raise ValueError("paper meeting must belong to a committee")
+        required = ("title", "purpose", "background", "recommendation", "implications")
+        if not isinstance(fields, dict) or any(not str(fields.get(key, "")).strip() for key in required):
+            raise ValueError("all paper template fields are required")
+        document_id = self.add_document(org, actor, fields["title"].strip(), content, meeting_id,
+                                        agenda_id, classification, content_type)
+        revision = self.execute(
+            "SELECT id FROM document_versions WHERE organisation_id=? AND document_id=? AND version_number=1",
+            (org, document_id),
+        ).fetchone()
+        paper_id, timestamp = uid(), now()
+        self.execute(
+            "INSERT INTO board_papers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (paper_id, org, document_id, meeting_id, meeting["committee_id"], agenda_id, actor,
+             *(fields[key].strip() for key in required), "draft", revision["id"], 1,
+             timestamp, timestamp, None),
+        )
+        self.conn.commit()
+        self.audit(org, actor, "paper.created", "board_paper", paper_id,
+                   {"revision_id": revision["id"], "meeting_id": meeting_id, "agenda_item_id": agenda_id})
+        return paper_id
+
+    def board_paper(self, org, paper_id):
+        row = self.execute(
+            "SELECT p.*,v.version_number,v.sha256,v.size_bytes,v.content_type "
+            "FROM board_papers p JOIN document_versions v ON v.id=p.current_revision_id "
+            "AND v.organisation_id=p.organisation_id WHERE p.id=? AND p.organisation_id=? "
+            "AND p.deleted_at IS NULL", (paper_id, org),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_board_papers(self, org, meeting_id=None, actor=None, reviewer_only=False):
+        sql = ("SELECT p.*,v.version_number,v.sha256,v.size_bytes,v.content_type,"
+               "a.title agenda_title,m.title meeting_title,r.deadline review_deadline,r.status review_status "
+               "FROM board_papers p JOIN document_versions v ON v.id=p.current_revision_id "
+               "AND v.organisation_id=p.organisation_id JOIN agenda_items a ON a.id=p.agenda_item_id "
+               "AND a.organisation_id=p.organisation_id JOIN meetings m ON m.id=p.meeting_id "
+               "AND m.organisation_id=p.organisation_id LEFT JOIN paper_review_assignments r "
+               "ON r.paper_id=p.id AND r.revision_id=p.current_revision_id AND r.organisation_id=p.organisation_id ")
+        params = []
+        if actor:
+            sql += "AND r.reviewer_member_id=? "
+            params.append(actor)
+        sql += "WHERE p.organisation_id=? AND p.deleted_at IS NULL "
+        params.append(org)
+        if meeting_id:
+            sql += "AND p.meeting_id=? "
+            params.append(meeting_id)
+        if reviewer_only:
+            sql += "AND r.id IS NOT NULL "
+        return [dict(row) for row in self.execute(sql + "ORDER BY p.updated_at DESC,p.id", params)]
+
+    def transition_board_paper(self, org, actor, paper_id, transition, expected_revision_id,
+                               expected_lock_version, reason=None):
+        """Apply a compare-and-swap transition bound to the exact binary revision."""
+        self._require_member(org, actor)
+        paper = self.board_paper(org, paper_id)
+        if not paper:
+            raise ValueError("paper outside tenant")
+        if paper["current_revision_id"] != expected_revision_id or paper["lock_version"] != expected_lock_version:
+            raise StaleRevisionError("paper changed; refresh before continuing")
+        transitions = {
+            "submit": ({"draft", "changes_requested"}, "submitted"),
+            "start_review": ({"submitted", "resubmitted"}, "under_review"),
+        }
+        if transition not in transitions or paper["status"] not in transitions[transition][0]:
+            raise ValueError(f"cannot {transition} paper from {paper['status']}")
+        if transition == "submit" and paper["author_member_id"] != actor:
+            raise PermissionError("only the author may submit this paper")
+        target = "resubmitted" if transition == "submit" and paper["status"] == "changes_requested" else transitions[transition][1]
+        timestamp = now()
+        result = self.execute(
+            "UPDATE board_papers SET status=?,lock_version=lock_version+1,updated_at=? "
+            "WHERE id=? AND organisation_id=? AND current_revision_id=? AND lock_version=?",
+            (target, timestamp, paper_id, org, expected_revision_id, expected_lock_version),
+        )
+        if result.rowcount != 1:
+            self.conn.rollback(); raise StaleRevisionError("paper changed; refresh before continuing")
+        self.conn.commit()
+        self.audit(org, actor, f"paper.{target}", "board_paper", paper_id,
+                   {"revision_id": expected_revision_id, "reason": reason})
+        return self.board_paper(org, paper_id)
+
+    def revise_board_paper(self, org, actor, paper_id, fields, content, expected_revision_id,
+                           content_type="application/pdf"):
+        paper = self.board_paper(org, paper_id)
+        if not paper or paper["author_member_id"] != actor:
+            raise PermissionError("only the tenant paper author may revise this paper")
+        if paper["current_revision_id"] != expected_revision_id:
+            raise StaleRevisionError("paper revision is stale")
+        if paper["status"] not in {"draft", "changes_requested", "approved", "published"}:
+            raise ValueError("paper cannot be revised in its current state")
+        self.replace_document(org, actor, paper["document_id"], content, content_type)
+        revision = self.execute(
+            "SELECT id FROM document_versions WHERE organisation_id=? AND document_id=? ORDER BY version_number DESC LIMIT 1",
+            (org, paper["document_id"]),
+        ).fetchone()
+        allowed_fields = ("title", "purpose", "background", "recommendation", "implications")
+        values = {key: str(fields.get(key, paper[key])).strip() for key in allowed_fields}
+        if any(not value for value in values.values()): raise ValueError("all paper template fields are required")
+        self.execute("UPDATE paper_review_assignments SET status='superseded' WHERE organisation_id=? AND paper_id=? AND status='assigned'", (org, paper_id))
+        self.execute(
+            "UPDATE board_papers SET title=?,purpose=?,background=?,recommendation=?,implications=?,"
+            "status='draft',current_revision_id=?,lock_version=lock_version+1,updated_at=? "
+            "WHERE id=? AND organisation_id=? AND current_revision_id=?",
+            (*values.values(), revision["id"], now(), paper_id, org, expected_revision_id),
+        )
+        self.conn.commit()
+        self.audit(org, actor, "paper.revised", "board_paper", paper_id,
+                   {"previous_revision_id": expected_revision_id, "revision_id": revision["id"]})
+        return self.board_paper(org, paper_id)
+
+    def assign_paper_reviewer(self, org, actor, paper_id, reviewer_id, deadline=None):
+        paper = self.board_paper(org, paper_id)
+        if not paper: raise ValueError("paper outside tenant")
+        self._require_member(org, actor); self._require_member(org, reviewer_id)
+        if paper["status"] not in {"submitted", "resubmitted", "under_review"}:
+            raise ValueError("paper is not ready for review")
+        if deadline: self._validated_datetime(deadline, "review deadline")
+        assignment_id, timestamp = uid(), now()
+        try:
+            self.execute("INSERT INTO paper_review_assignments VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (assignment_id, org, paper_id, paper["current_revision_id"], reviewer_id,
+                          deadline, "assigned", actor, timestamp, None, None))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("reviewer is already assigned to this revision") from exc
+        self.execute("UPDATE board_papers SET status='under_review',lock_version=lock_version+1,updated_at=? WHERE id=? AND organisation_id=?", (timestamp, paper_id, org))
+        self.conn.commit(); self.audit(org, actor, "paper.review_assigned", "board_paper", paper_id,
+            {"revision_id": paper["current_revision_id"], "reviewer_member_id": reviewer_id, "deadline": deadline})
+        return assignment_id
+
+    def review_board_paper(self, org, actor, paper_id, decision, revision_id, reason):
+        if decision not in {"changes_requested", "approved"}: raise ValueError("invalid review decision")
+        if not str(reason or "").strip(): raise ValueError("review reason is required")
+        paper = self.board_paper(org, paper_id)
+        if not paper: raise ValueError("paper outside tenant")
+        if paper["current_revision_id"] != revision_id: raise StaleRevisionError("cannot approve a superseded revision")
+        assignment = self.execute("SELECT id,status FROM paper_review_assignments WHERE organisation_id=? AND paper_id=? AND revision_id=? AND reviewer_member_id=?", (org, paper_id, revision_id, actor)).fetchone()
+        if not assignment or assignment["status"] != "assigned": raise PermissionError("active review assignment required")
+        timestamp = now()
+        self.execute("UPDATE paper_review_assignments SET status=?,decided_at=?,reason=? WHERE id=? AND organisation_id=?", (decision, timestamp, reason.strip(), assignment["id"], org))
+        self.execute("UPDATE board_papers SET status=?,lock_version=lock_version+1,updated_at=? WHERE id=? AND organisation_id=? AND current_revision_id=?", (decision, timestamp, paper_id, org, revision_id))
+        self.conn.commit(); self.audit(org, actor, f"paper.{decision}", "board_paper", paper_id,
+            {"revision_id": revision_id, "reason": reason.strip(), "assignment_id": assignment["id"]})
+        return self.board_paper(org, paper_id)
+
+    def add_paper_comment(self, org, actor, paper_id, revision_id, body):
+        paper = self.board_paper(org, paper_id)
+        revision = self.execute("SELECT 1 FROM document_versions WHERE id=? AND document_id=? AND organisation_id=?", (revision_id, paper["document_id"] if paper else None, org)).fetchone()
+        if not paper or not revision: raise ValueError("paper revision outside tenant")
+        if not str(body or "").strip(): raise ValueError("comment is required")
+        comment_id = uid(); self.execute("INSERT INTO paper_review_comments VALUES(?,?,?,?,?,?,?,NULL)", (comment_id, org, paper_id, revision_id, actor, body.strip(), now()))
+        self.conn.commit(); self.audit(org, actor, "paper.comment_added", "board_paper", paper_id, {"revision_id": revision_id, "comment_id": comment_id})
+        return comment_id
+
+    def publish_board_pack(self, org, actor, meeting_id, paper_ids, label=None):
+        self._require_member(org, actor); self._require_meeting(org, meeting_id)
+        if not paper_ids or len(set(paper_ids)) != len(paper_ids): raise ValueError("select unique approved papers")
+        papers = []
+        for paper_id in paper_ids:
+            paper = self.board_paper(org, paper_id)
+            if not paper or paper["meeting_id"] != meeting_id or paper["status"] != "approved":
+                raise ValueError("board pack may contain only approved papers for this meeting")
+            papers.append(paper)
+        number = self.execute("SELECT coalesce(max(edition_number),0)+1 n FROM board_pack_editions WHERE organisation_id=? AND meeting_id=?", (org, meeting_id)).fetchone()["n"]
+        edition_id, timestamp = uid(), now()
+        self.execute("INSERT INTO board_pack_editions VALUES(?,?,?,?,?,?,?)", (edition_id, org, meeting_id, number, label or f"Edition {number}", actor, timestamp))
+        for position, paper in enumerate(papers, 1):
+            self.execute("INSERT INTO board_pack_items VALUES(?,?,?,?,?,?)", (uid(), org, edition_id, paper["id"], paper["current_revision_id"], position))
+            self.execute("UPDATE board_papers SET status='published',lock_version=lock_version+1,updated_at=? WHERE id=? AND organisation_id=?", (timestamp, paper["id"], org))
+        self.conn.commit(); self.audit(org, actor, "board_pack.published", "board_pack", edition_id, {"meeting_id": meeting_id, "edition_number": number, "items": [{"paper_id": p["id"], "revision_id": p["current_revision_id"]} for p in papers]})
+        return edition_id
+
+    def add_annotation(self, org, actor, document_id, revision_id, kind, locator, body=None):
+        if kind not in {"bookmark", "highlight", "note"} or not str(locator or "").strip(): raise ValueError("invalid annotation")
+        revision = self.execute("SELECT 1 FROM document_versions WHERE organisation_id=? AND document_id=? AND id=?", (org, document_id, revision_id)).fetchone()
+        if not revision: raise ValueError("document revision outside tenant")
+        annotation_id, timestamp = uid(), now()
+        self.execute("INSERT INTO document_annotations VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)", (annotation_id, org, document_id, revision_id, actor, kind, locator.strip(), body, 0, timestamp, timestamp))
+        self.conn.commit(); self.audit(org, actor, "annotation.created", "document_annotation", annotation_id, {"revision_id": revision_id, "kind": kind})
+        return annotation_id
 
     def _agenda(self, org, meeting_id, agenda_id):
         row = self.execute("SELECT 1 FROM agenda_items WHERE id=? AND meeting_id=? "
