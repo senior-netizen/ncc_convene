@@ -22,6 +22,19 @@ class DuplicateVoteError(ValueError):
     """Raised when a member attempts to cast more than one vote on a motion."""
 
 
+MEETING_TRANSITIONS = {
+    "draft": ("scheduled", "cancelled"),
+    "scheduled": ("published", "cancelled"),
+    "published": ("completed", "cancelled"),
+    "completed": (),
+    "cancelled": (),
+}
+
+
+def allowed_meeting_transitions(status):
+    return list(MEETING_TRANSITIONS.get(status, ()))
+
+
 class Database:
     """Tenant-scoped persistence operations for the NCC Convene application."""
 
@@ -269,9 +282,7 @@ class Database:
         if status not in {"draft", "scheduled", "published", "completed", "cancelled"}:
             raise ValueError("invalid lifecycle status")
         meeting = self._require_meeting(org, meeting_id)
-        transitions = {"draft": {"scheduled", "cancelled"}, "scheduled": {"published", "cancelled"},
-                       "published": {"completed", "cancelled"}, "completed": set(), "cancelled": set()}
-        if status not in transitions[meeting["status"]]:
+        if status not in MEETING_TRANSITIONS.get(meeting["status"], ()):
             raise ValueError("invalid lifecycle transition")
         self.execute(
             "UPDATE meetings SET status=?,updated_at=? WHERE id=? AND organisation_id=?",

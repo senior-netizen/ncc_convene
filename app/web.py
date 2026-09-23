@@ -11,11 +11,15 @@ from email.parser import BytesParser
 from wsgiref.simple_server import make_server
 
 from .auth import read_token, token, verify_password
-from .db import Database, DuplicateVoteError
+from .db import Database, DuplicateVoteError, allowed_meeting_transitions
 from .policy import allowed, permissions_for
 
 DB = Database(os.getenv("APP_DATABASE", ".data/ncc-convene.db"))
-SECRET = os.getenv("APP_SESSION_SECRET", "development-only-secret")
+SECRET = os.getenv("APP_SESSION_SECRET")
+if not SECRET:
+    if os.getenv("APP_ENV", "development").lower() in {"production", "prod"}:
+        raise RuntimeError("APP_SESSION_SECRET must be configured outside development/test")
+    SECRET = "development-only-secret"
 COOKIE_SECURE = "; Secure" if os.getenv("APP_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"} else ""
 
 
@@ -170,12 +174,18 @@ def app(env, start):
         member = DB.execute("SELECT m.id,m.title,m.status,COALESCE(p.display_name,u.display_name) AS display_name,o.id AS organisation_id,o.name AS organisation_name FROM members m JOIN users u ON u.id=m.user_id JOIN organisations o ON o.id=m.organisation_id LEFT JOIN member_profiles p ON p.member_id=m.id AND p.organisation_id=m.organisation_id WHERE m.id=? AND m.organisation_id=? AND m.deleted_at IS NULL", (actor, org)).fetchone()
         return send("200 OK", {"member": dict(member), "roles": sorted(roles), "permissions": sorted(permissions_for(roles))})
     if path == "/api/v1/session/permissions" and method == "GET":
-        return send("200 OK", {"permissions": sorted(roles)})
+        return send("200 OK", {"permissions": sorted(permissions_for(roles))})
     if path == "/api/v1/meetings" and method == "GET":
         if not allowed(roles, "meetings.read"):
             return send("403 Forbidden", {"error": {"code": "forbidden", "message": "Permission denied."}})
-        meetings = [dict(row) for row in DB.execute("SELECT id,title,starts_at,ends_at,location,status,video_provider FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at", (org,))]
-        return send("200 OK", {"items": meetings})
+        query = parse_qs(env.get("QUERY_STRING", ""), keep_blank_values=True)
+        try:
+            limit = min(max(int(query.get("limit", ["50"])[0]), 1), 100)
+            offset = max(int(query.get("offset", ["0"])[0]), 0)
+        except ValueError:
+            return send("400 Bad Request", {"error": {"code": "invalid_pagination", "message": "limit and offset must be integers."}})
+        meetings = [dict(row) for row in DB.execute("SELECT id,title,starts_at,ends_at,location,status,video_provider FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at,id LIMIT ? OFFSET ?", (org, limit, offset))]
+        return send("200 OK", {"items": meetings, "limit": limit, "offset": offset})
     if path.startswith("/api/v1/meetings/") and path.endswith("/agenda") and method == "GET":
         meeting_id = path.rstrip("/").split("/")[-2]
         if not DB.meeting(org, meeting_id):
@@ -188,7 +198,7 @@ def app(env, start):
         if not meeting:
             return send("404 Not Found", {"error": {"code": "not_found", "message": "Meeting not found."}})
         q = DB.quorum(org, meeting_id)
-        return send("200 OK", {"meeting": dict(meeting), "quorum": dict(q), "allowed_transitions": {"draft": ["scheduled", "cancelled"], "scheduled": ["published", "cancelled"], "published": ["completed", "cancelled"], "completed": [], "cancelled": []}.get(meeting["status"], [])})
+        return send("200 OK", {"meeting": dict(meeting), "quorum": dict(q), "allowed_transitions": allowed_meeting_transitions(meeting["status"])})
 
     def require(permission):
         if allowed(roles, permission):
