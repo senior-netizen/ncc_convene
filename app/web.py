@@ -316,9 +316,6 @@ def app(env, start):
                 elif '/conflicts/' in path and path.endswith('/recusal'):
                     if not require('conflicts.manage'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.manage_conflict_recusal(org, actor, meeting_id, path.strip('/').split('/')[3], data['status'])
-                elif path.endswith('/participants'):
-                    if not require('meetings.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
-                    DB.assign_attendee(org, actor, meeting_id, data['member_id'], data.get('observer') == '1')
                 elif path.endswith('/motions'):
                     if not require('motions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.create_motion(org, actor, meeting_id, data['agenda_item_id'], data['proposer_member_id'], data['text'])
@@ -332,6 +329,10 @@ def app(env, start):
                 elif path.endswith('/resolutions'):
                     if not require('resolutions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.create_resolution(org, actor, meeting_id, data['agenda_item_id'], data['text'], data['outcome'], data.get('motion_id') or None, data.get('status', 'draft'))
+                elif '/minutes/' in path and path.endswith('/items'):
+                    if not require('minutes.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
+                    minute_id = path.strip('/').split('/')[3]
+                    DB.add_minute_item(org, actor, minute_id, data['item_type'], data['body'], int(data.get('position', '0')))
                 elif path.endswith('/minutes'):
                     if not require('minutes.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.save_minutes(org, actor, meeting_id, data['agenda_item_id'], data['body'], data.get('status', 'draft'))
@@ -366,11 +367,10 @@ def app(env, start):
             conflicts = list(DB.execute('SELECT c.*, COALESCE(p.display_name,u.display_name) name, a.title agenda_title FROM conflict_declarations c JOIN members m ON m.id=c.member_id LEFT JOIN member_profiles p ON p.member_id=m.id LEFT JOIN users u ON u.id=m.user_id LEFT JOIN agenda_items a ON a.id=c.agenda_item_id WHERE c.organisation_id=? AND c.meeting_id=? AND c.deleted_at IS NULL ORDER BY c.created_at', (org, meeting_id)))
             motions = list(DB.execute('SELECT m.*, a.title agenda_title FROM motions m JOIN agenda_items a ON a.id=m.agenda_item_id WHERE m.organisation_id=? AND m.meeting_id=? AND m.deleted_at IS NULL ORDER BY m.created_at', (org, meeting_id)))
             resolutions = list(DB.execute('SELECT * FROM resolution_traceability WHERE organisation_id=? AND meeting_id=?', (org, meeting_id)))
-            actions = DB.action_traceability(org)
-            actions = [a for a in actions if a['meeting_id'] == meeting_id]
+            actions = list(DB.execute('SELECT a.*, COALESCE(p.display_name,u.display_name) owner_name FROM action_traceability a JOIN members m ON m.id=a.owner_member_id LEFT JOIN member_profiles p ON p.member_id=m.id LEFT JOIN users u ON u.id=m.user_id WHERE a.organisation_id=? AND a.meeting_id=? ORDER BY a.action_year,a.action_number', (org, meeting_id)))
             q = DB.quorum(org, meeting_id)
             minutes = list(DB.execute('SELECT m.*, a.title agenda_title FROM minutes m JOIN agenda_items a ON a.id=m.agenda_item_id WHERE m.organisation_id=? AND m.meeting_id=? AND m.deleted_at IS NULL ORDER BY a.position', (org, meeting_id)))
-            minute_rows = ''.join(f'<li><strong>{escape(m["agenda_title"])}</strong> — {escape(m["status"])}: {escape(m["body"])}</li>' for m in minutes)
+            minute_rows = ''.join(f'<li><strong>{escape(m["agenda_title"])}</strong> — {escape(m["status"])}: {escape(m["body"])}<ul>' + ''.join(f'<li>{escape(i["item_type"])}: {escape(i["body"])}</li>' for i in DB.execute('SELECT item_type,body FROM minute_items WHERE minute_id=? AND organisation_id=? AND deleted_at IS NULL ORDER BY position', (m['id'], org))) + (f'</ul><form method="post" action="/meetings/{meeting_id}/minutes/{m["id"]}/items">{csrf_input(session)}<select name="item_type"><option>discussion</option><option>decision</option><option>action</option><option>note</option></select><input name="body" required><input type="number" name="position" min="0" value="0" required><button type="submit">Add minute item</button></form>' if allowed(roles, 'minutes.write') else '</ul>') + '</li>' for m in minutes)
             agenda_rows = ''.join(f'<li>{escape(row["title"])} </li>' for row in agenda)
             paper_rows = ''.join(f'<tr><td>{escape(row["title"])}</td><td>{escape(row["classification"])}</td><td>{row["version_number"] or 0}</td><td>{row["size_bytes"] or 0} bytes</td><td><a href="/documents/{row["id"]}/download">View/download</a> · <a href="/documents/{row["id"]}/versions">Versions</a></td></tr>' for row in papers)
             paper_form = ''
@@ -386,11 +386,17 @@ def app(env, start):
                 except (TypeError, ValueError): join_url = None
                 if join_url: join = f'<p><a href="{escape(join_url)}">Join Meeting</a></p>'
             conflict_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(escape(c['name'] or ''), escape(c['agenda_title'] or 'Whole meeting / general'), escape(c['interest']), escape(c['management_action']), escape(c['status']), (f'<form method="post" action="/meetings/{meeting_id}/conflicts/{c["id"]}/recusal">{csrf_input(session)}<select name="status"><option value="recusal_required">Recusal required</option><option value="recusal_approved">Recusal approved</option></select><button type="submit">Save recusal</button></form>' if allowed(roles, 'conflicts.manage') else '')) for c in conflicts)
-            motion_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td><td>For {} / Against {} / Abstain {}</td></tr>'.format(escape(m['agenda_title']), escape(m['text']), escape(m['status']), DB.vote_tally(org, meeting_id, m['id'])['for'], DB.vote_tally(org, meeting_id, m['id'])['against'], DB.vote_tally(org, meeting_id, m['id'])['abstain']) for m in motions)
+            def motion_summary(m):
+                tally = DB.vote_tally(org, meeting_id, m['id'])
+                result = 'Carried' if tally['passed'] else 'Not Carried'
+                quorum = 'Met' if tally['quorum_met'] else 'Not Met'
+                return f'For {tally["for"]} · Against {tally["against"]} · Abstain {tally["abstain"]} · Eligible {tally["eligible"]} · Quorum: {quorum}' + (f' · Result: {result}' if m['status'] == 'closed' else '')
+            motion_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(escape(m['agenda_title']), escape(m['text']), escape(m['status']), motion_summary(m)) for m in motions)
             resolution_rows = ''.join('<tr><td>NCC/RES/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(r['resolution_year'], r['resolution_number'], escape(r['text']), escape(r['outcome']), escape(r['status'])) for r in resolutions)
-            action_rows = ''.join('<tr><td>NCC/ACT/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(a['action_year'], a['action_number'], escape(a['description']), escape(a['owner_member_id']), escape(a['priority']), escape(a['status']) + (' · OVERDUE' if a['is_overdue'] else ''), a['update_count']) for a in actions)
-            action_forms = ''.join((f'<div class="card"><strong>NCC/ACT/{a["action_year"]}/{a["action_number"]:03d}</strong><form method="post" action="/actions/{a["id"]}/updates">{csrf_input(session)}<label>Progress update <textarea name="body" required></textarea></label><label>Status <select name="status"><option value="">Keep status</option><option>open</option><option>in_progress</option><option>completed</option></select></label><button type="submit">Add Progress Update</button></form><form method="post" action="/actions/{a["id"]}/evidence" enctype="multipart/form-data">{csrf_input(session)}<label>Evidence note <input name="note" required></label><label>Evidence PDF <input type="file" name="file" accept=".pdf,application/pdf"></label><button type="submit">Add Completion Evidence</button></form><form method="post" action="/actions/{a["id"]}/complete">{csrf_input(session)}<button type="submit">Complete Action</button></form></div>' if a['status'] in ('open', 'in_progress') and action_access(a['id'], 'actions.write') else '') for a in actions)
-            member_options = ''.join(f'<option value="{m["member_id"]}">{escape(m["name"] or "")}</option>' for m in organisation_members)
+            action_rows = ''.join('<tr><td>NCC/ACT/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(a['action_year'], a['action_number'], escape(a['description']), escape(a['owner_name'] or ''), escape(a['priority']), escape(a['due_at'] or '—'), escape(a['status']) + (' · OVERDUE' if a['is_overdue'] else ''), a['update_count']) + (f' · Completed {escape(a["completed_at"])}' if a['completed_at'] else '') for a in actions)
+            action_forms = ''.join((f'<div class="card"><strong>NCC/ACT/{a["action_year"]}/{a["action_number"]:03d}</strong><form method="post" action="/actions/{a["id"]}/updates">{csrf_input(session)}<label>Progress update <textarea name="body" required></textarea></label><label>Status <select name="status"><option value="">Keep status</option>{"<option>in_progress</option>" if a["status"] == "open" else ""}<option>cancelled</option></select></label><button type="submit">Add Progress Update</button></form><form method="post" action="/actions/{a["id"]}/evidence" enctype="multipart/form-data">{csrf_input(session)}<label>Evidence note <input name="note" required></label><label>Evidence PDF <input type="file" name="file" accept=".pdf,application/pdf"></label><button type="submit">Add Completion Evidence</button></form><form method="post" action="/actions/{a["id"]}/complete">{csrf_input(session)}<button type="submit">Complete Action</button></form></div>' if a['status'] in ('open', 'in_progress') and action_access(a['id'], 'actions.write') else '') for a in actions)
+            assigned_ids = {p['member_id'] for p in participants}
+            member_options = ''.join(f'<option value="{m["member_id"]}">{escape(m["name"] or "")}</option>' for m in organisation_members if m['member_id'] not in assigned_ids)
             agenda_options = '<option value="">Whole Meeting / General Conflict</option>' + ''.join(f'<option value="{a["id"]}">{escape(a["title"])}</option>' for a in agenda)
             agenda_options_required = ''.join(f'<option value="{a["id"]}">{escape(a["title"])}</option>' for a in agenda)
             lifecycle = ''
