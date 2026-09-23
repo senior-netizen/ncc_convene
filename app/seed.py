@@ -57,11 +57,12 @@ AGENDA = (
     "Digital trade and investment update",
     "Resolutions, actions and close",
 )
+ASSET_DIR = Path(__file__).parent.parent / "assets" / "demo"
 PAPERS = (
-    (3, "Q3 2026 Competitiveness Dashboard", b"NCC Q3 2026 competitiveness dashboard v1.0"),
-    (4, "2027 National Competitiveness Outlook", b"NCC 2027 outlook board paper v1.0"),
-    (5, "SME Regulatory Reform Programme", b"NCC SME reform board paper v1.0"),
-    (6, "Digital Trade and Investment Update", b"NCC digital trade board paper v1.0"),
+    (3, "Q3 2026 Competitiveness Dashboard", ASSET_DIR / "q3-dashboard.pdf"),
+    (4, "2027 National Competitiveness Outlook", ASSET_DIR / "outlook-2027.pdf"),
+    (5, "SME Regulatory Reform Programme", ASSET_DIR / "sme-reform.pdf"),
+    (6, "Digital Trade and Investment Update", ASSET_DIR / "digital-trade.pdf"),
 )
 
 
@@ -157,7 +158,8 @@ def seed(db, *, reset=False, actor_member_id=None, development=None):
                    "title=excluded.title,metadata=excluded.metadata,position=excluded.position,"
                    "updated_at=excluded.updated_at,deleted_at=NULL",
                    (agenda_id, ORGANISATION_ID, MEETING_ID, None, title, "{}", position, SEED_TIME, SEED_TIME))
-    for position, title, content in PAPERS:
+    for position, title, asset in PAPERS:
+        content = asset.read_bytes()
         document_id, version_id = _id("document", title), _id("document-version", title)
         db.execute("INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET "
                    "agenda_item_id=excluded.agenda_item_id,title=excluded.title,classification=excluded.classification,"
@@ -170,11 +172,14 @@ def seed(db, *, reset=False, actor_member_id=None, development=None):
                    "id=excluded.id,storage_key=excluded.storage_key,sha256=excluded.sha256,size_bytes=excluded.size_bytes,"
                    "created_by=excluded.created_by,created_at=excluded.created_at,content_type=excluded.content_type",
                    (version_id, ORGANISATION_ID, document_id, 1, str(seeded_path),
-                    hashlib.sha256(content).hexdigest(), len(content), secretary, SEED_TIME, "text/plain"))
+                    hashlib.sha256(content).hexdigest(), len(content), secretary, SEED_TIME, "application/pdf"))
     participants = board_emails + ("secretariat@ncc.example", "observer@ncc.example")
     responses = ("yes", "yes", "maybe", "yes", "no")
     for index, email in enumerate(participants):
-        member_id = members[email]; observer = int(email == "observer@ncc.example")
+        member_id = members[email]
+        # Secretariat attends operationally but, like the invited observer, is
+        # excluded from the 17-member board's voting/quorum denominator.
+        observer = int(email in {"secretariat@ncc.example", "observer@ncc.example"})
         db.execute("INSERT INTO meeting_attendees VALUES(?,?,?,?,?,?,?,?,NULL) ON CONFLICT(meeting_id,member_id) DO UPDATE SET "
                    "status=excluded.status,observer=excluded.observer,updated_at=excluded.updated_at,deleted_at=NULL",
                    (_id("attendee", email), ORGANISATION_ID, MEETING_ID, member_id,

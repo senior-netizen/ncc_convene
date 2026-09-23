@@ -5,7 +5,8 @@ import os
 from html import escape
 from http import cookies
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
+from datetime import datetime, timezone, timedelta
 from email import policy
 from email.parser import BytesParser
 from wsgiref.simple_server import make_server
@@ -54,6 +55,22 @@ def html_send(start, status, content, headers=()):
 def binary_send(start, status, content, content_type, headers=()):
     start(status, [("Content-Type", content_type), ("Content-Length", str(len(content))), *headers])
     return [content]
+
+
+def harare_datetime(value):
+    """Convert a browser datetime-local value to an explicit Harare offset."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        raise ValueError("browser due date must be local Harare time")
+    return parsed.replace(tzinfo=timezone(timedelta(hours=2))).isoformat()
+
+
+def download_name(title):
+    """Return an RFC 5987 filename parameter without header injection."""
+    safe = "".join(c for c in title if c not in "\r\n").strip() or "document"
+    if not safe.lower().endswith(".pdf"):
+        safe += ".pdf"
+    return "UTF-8''" + quote(safe, safe="")
 
 
 def login_page(message=""):
@@ -105,6 +122,9 @@ def app(env, start):
     def send(status, payload, headers=()):
         start(status, [("Content-Type", "application/json"), *headers])
         return [json.dumps(payload).encode()]
+
+    def error(status, code, message):
+        return send(status, {"error": {"code": code, "message": message}})
 
     def body():
         try:
@@ -177,30 +197,73 @@ def app(env, start):
         return send("200 OK", {"permissions": sorted(permissions_for(roles))})
     if path == "/api/v1/meetings" and method == "GET":
         if not allowed(roles, "meetings.read"):
-            return send("403 Forbidden", {"error": {"code": "forbidden", "message": "Permission denied."}})
+            return error("403 Forbidden", "forbidden", "Permission denied.")
         query = parse_qs(env.get("QUERY_STRING", ""), keep_blank_values=True)
         try:
-            limit = min(max(int(query.get("limit", ["50"])[0]), 1), 100)
-            offset = max(int(query.get("offset", ["0"])[0]), 0)
-        except ValueError:
-            return send("400 Bad Request", {"error": {"code": "invalid_pagination", "message": "limit and offset must be integers."}})
-        meetings = [dict(row) for row in DB.execute("SELECT id,title,starts_at,ends_at,location,status,video_provider FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at,id LIMIT ? OFFSET ?", (org, limit, offset))]
+            limit = int(query.get("limit", ["50"])[0])
+            offset = int(query.get("offset", ["0"])[0])
+            if not 1 <= limit <= 100 or not 0 <= offset <= 9223372036854775807:
+                raise ValueError
+        except (ValueError, OverflowError):
+            return error("400 Bad Request", "invalid_pagination", "limit must be 1-100 and offset must be a non-negative SQLite integer.")
+        meetings = [dict(row) for row in DB.execute("SELECT id,title,starts_at,location,status,quorum_percent,video_provider FROM meetings WHERE organisation_id=? AND deleted_at IS NULL ORDER BY starts_at,id LIMIT ? OFFSET ?", (org, limit, offset))]
         return send("200 OK", {"items": meetings, "limit": limit, "offset": offset})
-    if path.startswith("/api/v1/meetings/") and path.endswith("/agenda") and method == "GET":
-        meeting_id = path.rstrip("/").split("/")[-2]
+    api_parts = path.strip("/").split("/")
+    if len(api_parts) == 5 and api_parts[:3] == ["api", "v1", "meetings"] and api_parts[4] == "agenda" and method == "GET":
+        if not allowed(roles, "meetings.read"):
+            return error("403 Forbidden", "forbidden", "Permission denied.")
+        meeting_id = api_parts[3]
         if not DB.meeting(org, meeting_id):
-            return send("404 Not Found", {"error": {"code": "not_found", "message": "Meeting not found."}})
-        agenda = [dict(row) for row in DB.execute("SELECT id,parent_id,title,description,position,status FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id", (org, meeting_id))]
+            return error("404 Not Found", "not_found", "Meeting not found.")
+        agenda = [dict(row) for row in DB.execute("SELECT id,parent_id,title,metadata,position,created_at,updated_at FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id", (org, meeting_id))]
+        for item in agenda:
+            item["metadata"] = json.loads(item["metadata"] or "{}")
         return send("200 OK", {"items": agenda})
-    if path.startswith("/api/v1/meetings/") and method == "GET":
-        meeting_id = path.rstrip("/").split("/")[-1]
+    if len(api_parts) == 4 and api_parts[:3] == ["api", "v1", "meetings"] and method == "GET":
+        if not allowed(roles, "meetings.read"):
+            return error("403 Forbidden", "forbidden", "Permission denied.")
+        meeting_id = api_parts[3]
         meeting = DB.meeting(org, meeting_id)
         if not meeting:
             return send("404 Not Found", {"error": {"code": "not_found", "message": "Meeting not found."}})
         q = DB.quorum(org, meeting_id)
         participants = DB.execute("SELECT count(*) AS total, sum(CASE WHEN status='present' THEN 1 ELSE 0 END) AS present FROM meeting_attendees WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL", (org, meeting_id)).fetchone()
-        agenda = DB.execute("SELECT id,parent_id,title,position,status FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id", (org, meeting_id)).fetchall()
-        return send("200 OK", {"meeting": dict(meeting), "quorum": dict(q), "participants": {"total": participants["total"] or 0, "present": participants["present"] or 0}, "agenda": [dict(item) for item in agenda], "allowed_transitions": allowed_meeting_transitions(meeting["status"])})
+        agenda = DB.execute("SELECT id,parent_id,title,metadata,position,created_at,updated_at FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id", (org, meeting_id)).fetchall()
+        agenda_items = [dict(item) for item in agenda]
+        for item in agenda_items:
+            item["metadata"] = json.loads(item["metadata"] or "{}")
+        public_meeting = {key: meeting[key] for key in ("id", "committee_id", "title", "starts_at", "location", "status", "recurrence_rule", "quorum_percent", "video_provider", "video_metadata", "created_at", "updated_at")}
+        if public_meeting["video_metadata"]:
+            public_meeting["video_metadata"] = json.loads(public_meeting["video_metadata"])
+        return send("200 OK", {"meeting": public_meeting, "quorum": dict(q), "participants": {"total": participants["total"] or 0, "present": participants["present"] or 0}, "agenda": agenda_items, "allowed_transitions": allowed_meeting_transitions(meeting["status"])})
+
+    if len(api_parts) == 5 and api_parts[:3] == ["api", "v1", "meetings"] and api_parts[4] == "workspace" and method == "GET":
+        if not allowed(roles, "meetings.read"):
+            return error("403 Forbidden", "forbidden", "Permission denied.")
+        meeting_id = api_parts[3]
+        meeting = DB.meeting(org, meeting_id)
+        if not meeting:
+            return error("404 Not Found", "not_found", "Meeting not found.")
+        def rows(sql, params=(org, meeting_id)):
+            return [dict(row) for row in DB.execute(sql, params)]
+        agenda = rows("SELECT id,parent_id,title,metadata,position,created_at,updated_at FROM agenda_items WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY position,id")
+        for item in agenda:
+            item["metadata"] = json.loads(item["metadata"] or "{}")
+        participants = rows("SELECT a.id,a.member_id,a.status,a.observer,a.created_at,a.updated_at,COALESCE(p.display_name,u.display_name) AS display_name FROM meeting_attendees a JOIN members m ON m.id=a.member_id AND m.organisation_id=a.organisation_id LEFT JOIN member_profiles p ON p.member_id=m.id AND p.organisation_id=m.organisation_id LEFT JOIN users u ON u.id=m.user_id WHERE a.organisation_id=? AND a.meeting_id=? AND a.deleted_at IS NULL ORDER BY display_name,a.id")
+        documents = rows("SELECT d.id,d.meeting_id,d.agenda_item_id,d.title,d.classification,d.status,d.created_at,d.updated_at,v.version_number,v.content_type,v.size_bytes,v.sha256,v.created_at AS version_created_at FROM documents d LEFT JOIN document_versions v ON v.document_id=d.id AND v.organisation_id=d.organisation_id AND v.version_number=(SELECT max(v2.version_number) FROM document_versions v2 WHERE v2.document_id=d.id AND v2.organisation_id=d.organisation_id) WHERE d.organisation_id=? AND d.meeting_id=? AND d.deleted_at IS NULL ORDER BY d.created_at,d.id") if allowed(roles, "documents.read") else []
+        conflicts = rows("SELECT id,agenda_item_id,member_id,interest,management_action,status,created_at,updated_at FROM conflict_declarations WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY created_at,id")
+        motions = rows("SELECT id,agenda_item_id,proposer_member_id,text,status,created_at,updated_at FROM motions WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY created_at,id")
+        for motion in motions:
+            motion["tally"] = DB.vote_tally(org, meeting_id, motion["id"])
+        resolutions = DB.resolution_traceability(org, meeting_id=meeting_id)
+        minutes = rows("SELECT id,agenda_item_id,body,status,created_at,updated_at FROM minutes WHERE organisation_id=? AND meeting_id=? AND deleted_at IS NULL ORDER BY created_at,id")
+        for minute in minutes:
+            minute["items"] = rows("SELECT id,item_type,body,position,created_at,updated_at FROM minute_items WHERE organisation_id=? AND minute_id=? AND deleted_at IS NULL ORDER BY position,id", (org, minute["id"]))
+        actions = DB.action_traceability(org, meeting_id=meeting_id)
+        public_meeting = {key: meeting[key] for key in ("id", "committee_id", "title", "starts_at", "location", "status", "recurrence_rule", "quorum_percent", "video_provider", "created_at", "updated_at")}
+        return send("200 OK", {"meeting": public_meeting, "agenda": agenda, "participants": participants,
+            "quorum": DB.quorum(org, meeting_id), "documents": documents, "conflicts": conflicts,
+            "motions": motions, "resolutions": resolutions, "minutes": minutes, "actions": actions})
 
     def require(permission):
         if allowed(roles, permission):
@@ -245,22 +308,35 @@ def app(env, start):
             else:
                 content = "<h1>Dashboard</h1><div class=\"empty\"><h2>No meetings yet</h2><p>Scheduled meetings will appear here when this module is used.</p></div>"
             return html_send(start, "200 OK", page("Dashboard", content, session, roles))
-        if browser and path.startswith('/documents/') and path.endswith('/download') and method == 'GET':
-            denied = browser_require('documents.read')
-            if denied: return denied
-            document_id = path.strip('/').split('/')[1]
-            document = DB.execute('SELECT d.title,v.storage_key,v.content_type,v.version_number FROM documents d JOIN document_versions v ON v.document_id=d.id AND v.organisation_id=d.organisation_id WHERE d.id=? AND d.organisation_id=? AND d.deleted_at IS NULL AND v.version_number=(SELECT max(v2.version_number) FROM document_versions v2 WHERE v2.document_id=d.id AND v2.organisation_id=?)', (document_id, org, org)).fetchone()
+        document_parts = path.strip('/').split('/')
+        if len(document_parts) == 3 and document_parts[0] == 'documents' and document_parts[2] == 'download' and method == 'GET':
+            if not allowed(roles, 'documents.read'):
+                return error('403 Forbidden', 'forbidden', 'Permission denied.')
+            document_id = document_parts[1]
+            requested = query.get('version', [None])[0]
+            try:
+                version = int(requested) if requested is not None else None
+                if version is not None and not 1 <= version <= 9223372036854775807: raise ValueError
+            except (ValueError, OverflowError):
+                return error('400 Bad Request', 'invalid_version', 'version must be a positive SQLite integer.')
+            version_clause = 'v.version_number=?' if version is not None else 'v.version_number=(SELECT max(v2.version_number) FROM document_versions v2 WHERE v2.document_id=d.id AND v2.organisation_id=?)'
+            params = (document_id, org, version) if version is not None else (document_id, org, org)
+            document = DB.execute(f'SELECT d.title,v.storage_key,v.content_type,v.version_number FROM documents d JOIN document_versions v ON v.document_id=d.id AND v.organisation_id=d.organisation_id WHERE d.id=? AND d.organisation_id=? AND d.deleted_at IS NULL AND {version_clause}', params).fetchone()
             if not document or not Path(document['storage_key']).is_file():
-                return html_send(start, '404 Not Found', page('Document unavailable', '<h1>Document unavailable</h1><p>This board paper is not available.</p>', session, roles))
+                return error('404 Not Found', 'not_found', 'Document version is unavailable.')
             content_type = document['content_type'] or 'application/octet-stream'
-            return binary_send(start, '200 OK', Path(document['storage_key']).read_bytes(), content_type, [('Content-Disposition', f'inline; filename="{escape(document["title"])}"')])
-        if browser and path.startswith('/documents/') and path.endswith('/versions') and method == 'GET':
-            denied = browser_require('documents.read')
-            if denied: return denied
-            document_id = path.strip('/').split('/')[1]
+            return binary_send(start, '200 OK', Path(document['storage_key']).read_bytes(), content_type, [('Content-Disposition', f"inline; filename*={download_name(document['title'])}")])
+        if len(document_parts) == 3 and document_parts[0] == 'documents' and document_parts[2] == 'versions' and method == 'GET':
+            if not allowed(roles, 'documents.read'):
+                return error('403 Forbidden', 'forbidden', 'Permission denied.')
+            document_id = document_parts[1]
+            exists = DB.execute('SELECT 1 FROM documents WHERE id=? AND organisation_id=? AND deleted_at IS NULL', (document_id, org)).fetchone()
+            if not exists: return error('404 Not Found', 'not_found', 'Document not found.')
             versions = DB.execute('SELECT version_number,size_bytes,sha256,content_type,created_at FROM document_versions WHERE document_id=? AND organisation_id=? ORDER BY version_number DESC', (document_id, org)).fetchall()
-            rows = ''.join(f'<tr><td>{v["version_number"]}</td><td>{v["size_bytes"]} bytes</td><td>{escape(v["content_type"] or "")}</td><td>{escape(v["created_at"])}</td><td><code>{escape(v["sha256"][:12])}…</code></td></tr>' for v in versions)
-            content = f'<h1>Document versions</h1><table><tr><th>Version</th><th>Size</th><th>Type</th><th>Uploaded</th><th>SHA-256</th></tr>{rows}</table>'
+            if not browser:
+                return send('200 OK', {'items': [dict(v) for v in versions]})
+            rows = ''.join(f'<tr><td>{v["version_number"]}</td><td>{v["size_bytes"]} bytes</td><td>{escape(v["content_type"] or "")}</td><td>{escape(v["created_at"])}</td><td><code>{escape(v["sha256"][:12])}…</code></td><td><a href="/documents/{document_id}/download?version={v["version_number"]}">Download</a></td></tr>' for v in versions)
+            content = f'<h1>Document versions</h1><table><tr><th>Version</th><th>Size</th><th>Type</th><th>Uploaded</th><th>SHA-256</th><th>File</th></tr>{rows}</table>'
             return html_send(start, '200 OK', page('Document versions', content, session, roles))
         if browser and method == 'POST' and path.startswith('/meetings/') and path.endswith('/documents'):
             denied = browser_require('documents.write')
@@ -373,13 +449,14 @@ def app(env, start):
                 elif '/minutes/' in path and path.endswith('/items'):
                     if not require('minutes.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     minute_id = path.strip('/').split('/')[3]
-                    DB.add_minute_item(org, actor, minute_id, data['item_type'], data['body'], int(data.get('position', '0')))
+                    DB.add_minute_item(org, actor, minute_id, data['item_type'], data['body'], int(data.get('position', '0')), meeting_id)
                 elif path.endswith('/minutes'):
                     if not require('minutes.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.save_minutes(org, actor, meeting_id, data['agenda_item_id'], data['body'], data.get('status', 'draft'))
                 elif path.endswith('/actions'):
                     if not require('actions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
-                    DB.create_action(org, actor, meeting_id, data['agenda_item_id'], data['owner_member_id'], data['description'], data.get('due_at') or None, data.get('resolution_id') or None, data.get('priority', 'normal'))
+                    due_at = harare_datetime(data['due_at']) if data.get('due_at') else None
+                    DB.create_action(org, actor, meeting_id, data['agenda_item_id'], data['owner_member_id'], data['description'], due_at, data.get('resolution_id') or None, data.get('priority', 'normal'))
                 elif '/actions/' in path and path.endswith('/updates'):
                     if not require('actions.write'): return html_send(start, '403 Forbidden', page('Access denied', '<h1>Access denied</h1>', session, roles))
                     DB.add_action_update(org, actor, path.strip('/').split('/')[3], data['body'], data.get('status') or None)
@@ -392,7 +469,9 @@ def app(env, start):
                     DB.complete_action(org, actor, path.strip('/').split('/')[3])
                 else:
                     raise ValueError('unsupported browser workflow action')
-            except (KeyError, ValueError, DuplicateVoteError) as exc:
+            except DuplicateVoteError as exc:
+                return html_send(start, '409 Conflict', page('Vote not accepted', f'<h1>Vote not accepted</h1><p>{escape(str(exc))}</p>', session, roles))
+            except (KeyError, ValueError) as exc:
                 return html_send(start, '400 Bad Request', page('Workflow update failed', f'<h1>Workflow update failed</h1><p>{escape(str(exc))}</p><p><a href="/meetings/{meeting_id}">Return to meeting</a></p>', session, roles))
             return html_send(start, '303 See Other', '', [('Location', f'/meetings/{meeting_id}')])
         if browser and method == "GET" and path.startswith("/meetings/") and len(path.strip('/').split('/')) == 2:
@@ -411,7 +490,7 @@ def app(env, start):
             actions = list(DB.execute('SELECT a.*, COALESCE(p.display_name,u.display_name) owner_name FROM action_traceability a JOIN members m ON m.id=a.owner_member_id LEFT JOIN member_profiles p ON p.member_id=m.id LEFT JOIN users u ON u.id=m.user_id WHERE a.organisation_id=? AND a.meeting_id=? ORDER BY a.action_year,a.action_number', (org, meeting_id)))
             q = DB.quorum(org, meeting_id)
             minutes = list(DB.execute('SELECT m.*, a.title agenda_title FROM minutes m JOIN agenda_items a ON a.id=m.agenda_item_id WHERE m.organisation_id=? AND m.meeting_id=? AND m.deleted_at IS NULL ORDER BY a.position', (org, meeting_id)))
-            minute_rows = ''.join(f'<li><strong>{escape(m["agenda_title"])}</strong> — {escape(m["status"])}: {escape(m["body"])}<ul>' + ''.join(f'<li>{escape(i["item_type"])}: {escape(i["body"])}</li>' for i in DB.execute('SELECT item_type,body FROM minute_items WHERE minute_id=? AND organisation_id=? AND deleted_at IS NULL ORDER BY position', (m['id'], org))) + (f'</ul><form method="post" action="/meetings/{meeting_id}/minutes/{m["id"]}/items">{csrf_input(session)}<select name="item_type"><option>discussion</option><option>decision</option><option>action</option><option>note</option></select><input name="body" required><input type="number" name="position" min="0" value="0" required><button type="submit">Add minute item</button></form>' if allowed(roles, 'minutes.write') else '</ul>') + '</li>' for m in minutes)
+            minute_rows = ''.join(f'<li><strong>{escape(m["agenda_title"])}</strong> — {escape(m["status"])}: {escape(m["body"])}<ul>' + ''.join(f'<li>{escape(i["item_type"])}: {escape(i["body"])}</li>' for i in DB.execute('SELECT item_type,body FROM minute_items WHERE minute_id=? AND organisation_id=? AND deleted_at IS NULL ORDER BY position', (m['id'], org))) + (f'</ul><form method="post" action="/meetings/{meeting_id}/minutes/{m["id"]}/items">{csrf_input(session)}<label>Item type <select name="item_type"><option>discussion</option><option>decision</option><option>action</option><option>note</option></select></label><label>Minute item <input name="body" required></label><label>Position <input type="number" name="position" min="0" value="0" required></label><button type="submit">Add minute item</button></form>' if allowed(roles, 'minutes.write') else '</ul>') + '</li>' for m in minutes)
             agenda_rows = ''.join(f'<li>{escape(row["title"])} </li>' for row in agenda)
             paper_rows = ''.join(f'<tr><td>{escape(row["title"])}</td><td>{escape(row["classification"])}</td><td>{row["version_number"] or 0}</td><td>{row["size_bytes"] or 0} bytes</td><td><a href="/documents/{row["id"]}/download">View/download</a> · <a href="/documents/{row["id"]}/versions">Versions</a></td></tr>' for row in papers)
             paper_form = ''
@@ -434,21 +513,23 @@ def app(env, start):
                 return f'For {tally["for"]} · Against {tally["against"]} · Abstain {tally["abstain"]} · Eligible {tally["eligible"]} · Quorum: {quorum}' + (f' · Result: {result}' if m['status'] == 'closed' else '')
             motion_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(escape(m['agenda_title']), escape(m['text']), escape(m['status']), motion_summary(m)) for m in motions)
             resolution_rows = ''.join('<tr><td>NCC/RES/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(r['resolution_year'], r['resolution_number'], escape(r['text']), escape(r['outcome']), escape(r['status'])) for r in resolutions)
-            action_rows = ''.join('<tr><td>NCC/ACT/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(a['action_year'], a['action_number'], escape(a['description']), escape(a['owner_name'] or ''), escape(a['priority']), escape(a['due_at'] or '—'), escape(a['status']) + (' · OVERDUE' if a['is_overdue'] else ''), a['update_count']) + (f' · Completed {escape(a["completed_at"])}' if a['completed_at'] else '') for a in actions)
+            action_rows = ''.join('<tr><td>NCC/ACT/{}/{:03d}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(a['action_year'], a['action_number'], escape(a['description']), escape(a['owner_name'] or ''), escape(a['priority']), escape(a['due_at'] or '—'), escape(a['status']) + (' · OVERDUE' if a['is_overdue'] else ''), a['update_count'], escape(a['completed_at'] or '—')) for a in actions)
             action_forms = ''.join((f'<div class="card"><strong>NCC/ACT/{a["action_year"]}/{a["action_number"]:03d}</strong><form method="post" action="/actions/{a["id"]}/updates">{csrf_input(session)}<label>Progress update <textarea name="body" required></textarea></label><label>Status <select name="status"><option value="">Keep status</option>{"<option>in_progress</option>" if a["status"] == "open" else ""}<option>cancelled</option></select></label><button type="submit">Add Progress Update</button></form><form method="post" action="/actions/{a["id"]}/evidence" enctype="multipart/form-data">{csrf_input(session)}<label>Evidence note <input name="note" required></label><label>Evidence PDF <input type="file" name="file" accept=".pdf,application/pdf"></label><button type="submit">Add Completion Evidence</button></form><form method="post" action="/actions/{a["id"]}/complete">{csrf_input(session)}<button type="submit">Complete Action</button></form></div>' if a['status'] in ('open', 'in_progress') and action_access(a['id'], 'actions.write') else '') for a in actions)
             assigned_ids = {p['member_id'] for p in participants}
-            member_options = ''.join(f'<option value="{m["member_id"]}">{escape(m["name"] or "")}</option>' for m in organisation_members if m['member_id'] not in assigned_ids)
+            participant_options = ''.join(f'<option value="{m["member_id"]}">{escape(m["name"] or "")}</option>' for m in organisation_members if m['member_id'] not in assigned_ids)
+            proposer_options = ''.join(f'<option value="{p["member_id"]}">{escape(p["name"] or "")}</option>' for p in participants if not p['observer'] and any(m['member_id'] == p['member_id'] for m in organisation_members))
+            owner_options = ''.join(f'<option value="{m["member_id"]}">{escape(m["name"] or "")}</option>' for m in organisation_members)
             agenda_options = '<option value="">Whole Meeting / General Conflict</option>' + ''.join(f'<option value="{a["id"]}">{escape(a["title"])}</option>' for a in agenda)
             agenda_options_required = ''.join(f'<option value="{a["id"]}">{escape(a["title"])}</option>' for a in agenda)
             lifecycle = ''
             if allowed(roles, 'meetings.write'):
                 next_statuses = {'draft': ('scheduled', 'cancelled'), 'scheduled': ('published', 'cancelled'), 'published': ('completed', 'cancelled')}.get(meeting['status'], ())
                 lifecycle = ''.join(f'<form method="post" action="/meetings/{meeting_id}/transition" style="display:inline">{csrf_input(session)}<input type="hidden" name="status" value="{s}"><button type="submit">{s.title()} meeting</button></form>' for s in next_statuses)
-            participant_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/participants">{csrf_input(session)}<h3>Assign participant</h3><select name="member_id" required>{member_options}</select><label><input type="checkbox" name="observer" value="1"> Observer</label><button type="submit">Assign</button></form>' if allowed(roles, 'meetings.write') else ''
+            participant_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/participants">{csrf_input(session)}<h3>Assign participant</h3><label>Active member <select name="member_id" required>{participant_options}</select></label><label><input type="checkbox" name="observer" value="1"> Observer</label><button type="submit">Assign</button></form>' if allowed(roles, 'meetings.write') else ''
             attendance_forms = ''.join(f'<form method="post" action="/meetings/{meeting_id}/attendance">{csrf_input(session)}<input type="hidden" name="member_id" value="{p["member_id"]}"><select name="status"><option>present</option><option>absent</option><option>apology</option></select><button type="submit">Save attendance for {escape(p["name"] or "")}</button></form>' for p in participants) if allowed(roles, 'attendance.write') else ''
             rsvp_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/rsvp">{csrf_input(session)}<h3>My RSVP</h3><select name="response"><option>yes</option><option>maybe</option><option>no</option></select><button type="submit">Save RSVP</button></form>' if allowed(roles, 'rsvp.write') else ''
             conflict_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/conflicts">{csrf_input(session)}<h3>Declare conflict</h3><label>Agenda item <select name="agenda_item_id">{agenda_options}</select></label><label>Interest <textarea name="interest" required></textarea></label><label>Management action <input name="management_action" required></label><button type="submit">Declare conflict</button></form>' if allowed(roles, 'conflicts.write') else ''
-            motion_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/motions">{csrf_input(session)}<h3>Create motion</h3><select name="agenda_item_id" required>{agenda_options_required}</select><select name="proposer_member_id" required>{member_options}</select><textarea name="text" required></textarea><button type="submit">Create motion</button></form>' if allowed(roles, 'motions.write') else ''
+            motion_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/motions">{csrf_input(session)}<h3>Create motion</h3><label>Agenda item <select name="agenda_item_id" required>{agenda_options_required}</select></label><label>Proposer <select name="proposer_member_id" required>{proposer_options}</select></label><label>Motion text <textarea name="text" required></textarea></label><button type="submit">Create motion</button></form>' if allowed(roles, 'motions.write') else ''
             def can_vote(motion):
                 attendee = DB.execute('SELECT 1 FROM meeting_attendees WHERE meeting_id=? AND member_id=? AND organisation_id=? AND status=\'present\' AND observer=0 AND deleted_at IS NULL', (meeting_id, actor, org)).fetchone()
                 recused = DB.execute('SELECT 1 FROM conflict_declarations WHERE meeting_id=? AND member_id=? AND organisation_id=? AND (agenda_item_id IS NULL OR agenda_item_id=?) AND status IN (\'recusal_required\',\'recusal_approved\') AND deleted_at IS NULL', (meeting_id, actor, org, motion['agenda_item_id'])).fetchone()
@@ -465,10 +546,11 @@ def app(env, start):
             motion_options = ''.join(f'<option value="{m["id"]}">{escape(m["agenda_title"])}: {escape(m["text"])}</option>' for m in closed_motions)
             resolution_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/resolutions">{csrf_input(session)}<h3>Create resolution</h3><select name="agenda_item_id" required>{agenda_options_required}</select><select name="motion_id"><option value="">No related motion</option>{motion_options}</select><input name="text" required><select name="outcome"><option>noted</option><option>carried</option><option>not_carried</option></select><select name="status"><option>draft</option><option>approved</option><option>published</option></select><button type="submit">Create resolution</button></form>' if allowed(roles, 'resolutions.write') else ''
             minutes_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/minutes">{csrf_input(session)}<h3>Save minutes</h3><select name="agenda_item_id" required>{agenda_options_required}</select><textarea name="body" required></textarea><select name="status"><option>draft</option><option>in_review</option><option>approved</option></select><button type="submit">Save minutes</button></form>' if allowed(roles, 'minutes.write') else ''
-            action_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/actions">{csrf_input(session)}<h3>Create action</h3><select name="agenda_item_id" required>{agenda_options_required}</select><select name="owner_member_id">{member_options}</select><select name="priority"><option>normal</option><option>low</option><option>high</option><option>critical</option></select><input name="description" required><input name="due_at" type="datetime-local"><button type="submit">Create action</button></form>' if allowed(roles, 'actions.write') else ''
+            resolution_options = ''.join(f'<option value="{r["id"]}">NCC/RES/{r["resolution_year"]}/{r["resolution_number"]:03d} — {escape(r["text"])}</option>' for r in resolutions)
+            action_form = f'<form class="card" method="post" action="/meetings/{meeting_id}/actions">{csrf_input(session)}<h3>Create action</h3><label>Agenda item <select name="agenda_item_id" required>{agenda_options_required}</select></label><label>Resolution <select name="resolution_id"><option value="">No linked resolution</option>{resolution_options}</select></label><label>Owner <select name="owner_member_id" required>{owner_options}</select></label><label>Priority <select name="priority"><option>normal</option><option>low</option><option>high</option><option>critical</option></select></label><label>Description <input name="description" required></label><label>Due date (Harare time, UTC+02:00) <input name="due_at" type="datetime-local"></label><button type="submit">Create action</button></form>' if allowed(roles, 'actions.write') else ''
             action_controls = ''
             replace_forms = ''.join(f'<form method="post" action="/documents/{p["id"]}/replace" enctype="multipart/form-data">{csrf_input(session)}<input type="file" name="file" accept=".pdf,application/pdf" required><button type="submit">Replace version</button></form>' for p in papers) if allowed(roles, 'documents.write') else ''
-            content = f'<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p><p>{lifecycle}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong></p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol>{agenda_form}</section><section id="papers"><h2>Board papers</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th><th>Access</th></tr>{paper_rows}</table>{replace_forms}{paper_form}</section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table>{participant_form}{attendance_forms}{rsvp_form}</section><section id="conflicts"><h2>Conflicts</h2><table><tr><th>Member</th><th>Agenda</th><th>Interest</th><th>Management</th><th>Status</th></tr>{conflict_rows}</table>{conflict_form}</section><section id="motions"><h2>Motions & voting</h2><table><tr><th>Agenda</th><th>Motion</th><th>Status</th><th>Tally</th></tr>{motion_rows}</table>{motion_controls}{motion_form}</section><section id="resolutions"><h2>Resolutions</h2><table><tr><th>Number</th><th>Text</th><th>Outcome</th><th>Status</th></tr>{resolution_rows}</table>{resolution_form}</section><section id="minutes"><h2>Minutes</h2><ul>{minute_rows or '<li>No minutes saved</li>'}</ul>{minutes_form}</section><section id="actions"><h2>Actions</h2><table><tr><th>Number</th><th>Description</th><th>Owner</th><th>Priority</th><th>Status</th><th>Updates</th></tr>{action_rows}</table>{action_forms}{action_form}</section>'
+            content = f'<h1>{escape(meeting["title"])}</h1><p><strong>Status:</strong> {escape(meeting["status"])} · <strong>When:</strong> {escape(meeting["starts_at"])} · <strong>Location:</strong> {escape(meeting["location"] or "")}</p><p>{lifecycle}</p>{join}<div class="card"><h2>Quorum</h2><p>{q["present"]} / {q["eligible"]} present — <strong>{"MET" if q["met"] else "NOT MET"}</strong></p></div><nav class="workspace-nav"><a href="#agenda">Agenda</a><a href="#papers">Board papers</a><a href="#attendance">Attendance</a><a href="#conflicts">Conflicts</a><a href="#motions">Motions & voting</a><a href="#resolutions">Resolutions</a><a href="#minutes">Minutes</a><a href="#actions">Actions</a></nav><section id="agenda"><h2>Agenda ({len(agenda)})</h2><ol>{agenda_rows or "<li>No agenda items</li>"}</ol>{agenda_form}</section><section id="papers"><h2>Board papers</h2><table><tr><th>Title</th><th>Classification</th><th>Version</th><th>Size</th><th>Access</th></tr>{paper_rows}</table>{replace_forms}{paper_form}</section><section id="attendance"><h2>Attendance & participants</h2><table><tr><th>Participant</th><th>Type</th><th>Status</th></tr>{participant_rows}</table>{participant_form}{attendance_forms}{rsvp_form}</section><section id="conflicts"><h2>Conflicts</h2><table><tr><th>Member</th><th>Agenda</th><th>Interest</th><th>Management</th><th>Status</th></tr>{conflict_rows}</table>{conflict_form}</section><section id="motions"><h2>Motions & voting</h2><table><tr><th>Agenda</th><th>Motion</th><th>Status</th><th>Tally</th></tr>{motion_rows}</table>{motion_controls}{motion_form}</section><section id="resolutions"><h2>Resolutions</h2><table><tr><th>Number</th><th>Text</th><th>Outcome</th><th>Status</th></tr>{resolution_rows}</table>{resolution_form}</section><section id="minutes"><h2>Minutes</h2><ul>{minute_rows or '<li>No minutes saved</li>'}</ul>{minutes_form}</section><section id="actions"><h2>Actions</h2><table><tr><th>Number</th><th>Description</th><th>Owner</th><th>Priority</th><th>Due</th><th>Status</th><th>Updates</th><th>Completed</th></tr>{action_rows}</table>{action_forms}{action_form}</section>'
             return html_send(start, '200 OK', page('Meeting workspace', content, session, roles))
         if browser and method == "GET" and path == "/members":
             denied = browser_require("members.read")
@@ -567,7 +649,7 @@ def app(env, start):
             return send("201 Created", {"id": DB.create_resolution(org, actor, meeting_id, data["agenda_item_id"], data["text"], data["outcome"], data.get("motion_id"), data.get("status", "approved"))})
         if resource == "resolutions" and method == "GET":
             if not require("meetings.read"): return send("403 Forbidden", {"error": "forbidden"})
-            return send("200 OK", {"resolutions": DB.resolution_traceability(org)})
+            return send("200 OK", {"resolutions": DB.resolution_traceability(org, meeting_id=meeting_id)})
         if resource == "minutes" and method == "POST" and len(parts) == 3:
             if not require("minutes.write"): return send("403 Forbidden", {"error": "forbidden"})
             return send("201 Created", {"id": DB.save_minutes(org, actor, meeting_id, data["agenda_item_id"], data["body"], data.get("status", "draft"))})
@@ -576,10 +658,10 @@ def app(env, start):
             return send("201 Created", {"id": DB.create_action(org, actor, meeting_id, data["agenda_item_id"], data["owner_member_id"], data["description"], data.get("due_at"), data.get("resolution_id"), data.get("priority", "normal"))})
         if resource == "actions" and method == "GET":
             if not require("meetings.read"): return send("403 Forbidden", {"error": "forbidden"})
-            return send("200 OK", {"actions": DB.action_traceability(org)})
+            return send("200 OK", {"actions": DB.action_traceability(org, meeting_id=meeting_id)})
         if resource == "minutes" and len(parts) == 5 and parts[4] == "items" and method == "POST":
             if not require("minutes.write"): return send("403 Forbidden", {"error": "forbidden"})
-            return send("201 Created", {"id": DB.add_minute_item(org, actor, parts[3], data["item_type"], data["body"], data["position"])})
+            return send("201 Created", {"id": DB.add_minute_item(org, actor, parts[3], data["item_type"], data["body"], data["position"], meeting_id)})
         if resource == "motions" and len(parts) == 5 and parts[4] == "votes" and method == "POST":
             motion_id, member_id = parts[3], data.get("member_id", actor)
             if not own_or("votes.write", member_id, "votes.manage"): return send("403 Forbidden", {"error": "forbidden"})
@@ -606,11 +688,11 @@ def app(env, start):
     except DuplicateVoteError as exc:
         if browser:
             return html_send(start, "409 Conflict", page("Vote not accepted", f"<h1>Vote not accepted</h1><p>{escape(str(exc))}</p>", session, roles))
-        return send("409 Conflict", {"error": str(exc)})
+        return error("409 Conflict", "duplicate_vote", str(exc))
     except (KeyError, TypeError, ValueError) as exc:
         if browser:
             return html_send(start, "400 Bad Request", page("Request not accepted", f"<h1>Request not accepted</h1><p>{escape(str(exc) or 'Invalid request')}</p>", session, roles))
-        return send("400 Bad Request", {"error": str(exc) or "invalid request"})
+        return error("400 Bad Request", "invalid_request", str(exc) or "Invalid request.")
 
 
 if __name__ == "__main__":
